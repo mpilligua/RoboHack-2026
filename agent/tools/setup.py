@@ -20,7 +20,6 @@ def build_registry() -> ToolRegistry:
 
     # Memory tools
     reg.register("get_visible_objects", memory_tools.handle_get_visible_objects, [CALLER_PLANNER])
-    reg.register("find_object", memory_tools.handle_find_object, [CALLER_PLANNER])
     reg.register("resolve_reference", memory_tools.handle_resolve_reference, [CALLER_PLANNER])
     reg.register("find_objects_matching_constraints", memory_tools.handle_find_objects_matching_constraints, [CALLER_PLANNER])
 
@@ -58,6 +57,9 @@ def build_registry() -> ToolRegistry:
     # Follow tools
     reg.register("follow_person", follow_tools.handle_follow_person, [CALLER_PLANNER])
     reg.register("go_to_object", follow_tools.handle_go_to_object, [CALLER_PLANNER])
+    reg.register("find_and_go_to", follow_tools.handle_find_and_go_to, [CALLER_PLANNER])
+    reg.register("find_object", follow_tools.handle_find_object, [CALLER_PLANNER])
+    reg.register("find_person_and_follow", follow_tools.handle_find_person_and_follow, [CALLER_PLANNER])
     reg.register("stop_tracking", follow_tools.handle_stop_tracking, [CALLER_PLANNER, CALLER_OPERATOR])
 
     return reg

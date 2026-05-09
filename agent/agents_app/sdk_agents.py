@@ -93,6 +93,10 @@ Tool selection rules:
       or when filtering for a specific COCO class via label_filter.
 - list_visible_objects accepts label_filter — use it instead of listing-then-filtering.
 - go_to_object returns immediately and auto-stops. Do NOT poll get_basic_goal_status.
+- After go_to_object / find_and_go_to / find_person_and_follow runs, the navigation
+  outcome (reached / lost_target / timeout) is written to the memory snapshot's
+  recent events with type='nav_outcome'. If the user asks 'did you reach it?' or
+  'where are you now?', check recent events first instead of issuing new perception calls.
 - When a request genuinely needs multiple INDEPENDENT read-only tools (e.g. describe_scene
   AND list_visible_objects for an unusual question that needs both), emit them as multiple
   tool_use blocks in the SAME response. They will run in parallel. Do NOT batch motion

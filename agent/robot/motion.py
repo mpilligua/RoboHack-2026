@@ -91,6 +91,30 @@ class Lite3Motion:
         # Always end with a zero — important so the dog doesn't keep coasting.
         self._publish(0.0, 0.0, 0.0)
 
+    def drive_continuous(self, vx: float, vy: float, omega: float, max_duration_s: float, hz: float = 20.0) -> float:
+        """Long-running velocity command bypassing the 2-second per-call cap
+        and the trailing zero. Intended for callers that own their own
+        interrupt path (set ``_stop_flag`` via ``stop()``) and want a smooth
+        continuous motion — e.g. the search-and-rotate sweep.
+
+        DOES NOT publish a final zero. Caller MUST eventually call ``stop()``
+        (or a normal ``forward``/``turn_*`` etc.) to halt the dog. Returns
+        actual elapsed time so the caller can compute distance/angle traveled.
+        """
+        vx = _clip(vx, MAX_LINEAR)
+        vy = _clip(vy, MAX_LINEAR)
+        omega = _clip(omega, MAX_ANGULAR)
+        max_duration_s = max(0.0, float(max_duration_s))
+
+        self._stop_flag.clear()
+        period = 1.0 / hz
+        start = time.time()
+        deadline = start + max_duration_s
+        while time.time() < deadline and not self._stop_flag.is_set():
+            self._publish(vx, vy, omega)
+            time.sleep(period)
+        return time.time() - start
+
     def forward(self, speed: float = 0.15, duration_s: float = 1.0) -> None:
         self._drive(speed, 0.0, 0.0, duration_s)
 

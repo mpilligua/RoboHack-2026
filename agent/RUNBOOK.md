@@ -49,7 +49,6 @@ roslaunch rosbridge_server rosbridge_websocket.launch
 ```
 ssh ysc@192.168.1.103
 source /opt/ros/foxy/setup.bash
-source /home/ysc/lite_cog_ros2/transfer/install/setup.bash
 ros2 launch rosbridge_server rosbridge_websocket_launch.xml port:=9091
 ```
 

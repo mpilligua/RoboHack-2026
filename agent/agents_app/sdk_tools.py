@@ -170,6 +170,52 @@ _SPECS = [
         },
         ["yolo_id"],
     ),
+    (
+        "find_and_go_to",
+        "Locate an object by label and walk to it, even if it isn't currently visible. "
+        "Rotates the robot in chunks (default 45° at a time, sweeping up to 360°), sampling "
+        "YOLO between chunks; stops as soon as a matching object appears, then auto-walks to "
+        "it (same auto-stop behavior as go_to_object). USE THIS instead of "
+        "list_visible_objects + go_to_object when the user asks to find/go to an object that "
+        "may not be in the current view (e.g. 'find the door and walk to it', 'go find a "
+        "chair'). Returns ok=false if a full 360° sweep finds nothing.",
+        {
+            "label": {"type": "string", "description": "COCO label to search for, e.g. 'door', 'chair', 'person'."},
+            "direction": {"type": "string", "enum": ["left", "right"], "description": "Sweep direction (default 'right')."},
+            "stop_distance_m": {"type": "number", "description": "Stop when depth <= this (default 0.8 m)."},
+            "max_sweep_deg": {"type": "number", "description": "Cap on total rotation (default 360)."},
+        },
+        ["label"],
+    ),
+    (
+        "find_object",
+        "Locate an object by label WITHOUT walking to it. Rotates the robot in chunks "
+        "(default 45°, sweeping up to 360°) sampling YOLO between chunks; stops at the first "
+        "match. Returns the yolo_id (the robot ends facing the target so a follow-up "
+        "go_to_object / follow_person works without re-searching). USE THIS when the user "
+        "asks 'where is X' or 'can you find X' WITHOUT a 'go to' / 'walk to' intent. "
+        "Returns ok=false if nothing matches after the sweep.",
+        {
+            "label": {"type": "string", "description": "COCO label to search for."},
+            "direction": {"type": "string", "enum": ["left", "right"], "description": "Sweep direction (default 'right')."},
+            "max_sweep_deg": {"type": "number", "description": "Cap on total rotation (default 360)."},
+        },
+        ["label"],
+    ),
+    (
+        "find_person_and_follow",
+        "Locate a person and start continuously following them, even if they aren't in the "
+        "current view. Same rotation-sampling search as find_and_go_to, but engages "
+        "follow_person (continuous tracking) on the first match instead of one-shot "
+        "approach. USE THIS when the user says 'find someone and follow them', 'look around "
+        "for a person and follow', etc. Defaults label='person'.",
+        {
+            "label": {"type": "string", "description": "COCO label to search for (default 'person')."},
+            "direction": {"type": "string", "enum": ["left", "right"], "description": "Sweep direction (default 'right')."},
+            "max_sweep_deg": {"type": "number", "description": "Cap on total rotation (default 360)."},
+        },
+        [],
+    ),
     ("stop_tracking", "Stop follow/go_to tracking.", {}, []),
 ]
 
