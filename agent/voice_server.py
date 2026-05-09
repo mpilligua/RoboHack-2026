@@ -35,8 +35,30 @@ from flask import Flask, jsonify, request, send_file
 # Allow running as `python voice_server.py` from agent/.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from cli import run_once, SYSTEM_PROMPT  # noqa: E402  (only for prompt; we re-implement loop below if needed)
-from robot import Lite3Follow, Lite3Motion, Lite3Robot  # noqa: E402
+from cli import run_once, SYSTEM_PROMPT  # noqa: E402  (legacy fallback)
+from robot import (  # noqa: E402
+    Lite3BasicGoal,
+    Lite3Follow,
+    Lite3Motion,
+    Lite3Robot,
+    connect_ros2_rosbridge,
+)
+
+# Same opt-out switch as cli.py: LEGACY_LOOP=1 forces the old run_once path.
+_USE_NEW_PIPELINE = os.environ.get("LEGACY_LOOP", "0") != "1"
+if _USE_NEW_PIPELINE:
+    from agents_app.orchestrator import Orchestrator  # noqa: E402
+    from agents_app.sdk_agents import (  # noqa: E402
+        DialogueAgent,
+        PlannerAgent,
+        _make_agent_client,
+        _use_openai_compat,
+    )
+    from memory.store import MemoryStore  # noqa: E402
+    from safety.supervisor import SafetySupervisor  # noqa: E402
+    from tools.base import ToolContext  # noqa: E402
+    from tools.setup import build_registry  # noqa: E402
+    from vlm_client import make_vlm_client  # noqa: E402
 
 
 load_dotenv()
@@ -49,25 +71,69 @@ LISTEN_PORT = int(os.environ.get("VOICE_PORT", "5050"))
 
 # -------------- robot connections (singleton) ---------------------------------
 
-_robot_state = {"robot": None, "motion": None, "follow": None, "lock": threading.Lock()}
+_robot_state = {
+    "robot": None,
+    "motion": None,
+    "follow": None,
+    "basic_goal": None,
+    "ros2_client": None,
+    "orchestrator": None,
+    "lock": threading.Lock(),
+}
 
 
 def _connect_robot():
+    """Mirror cli.py's connection + orchestrator setup so voice and CLI run the
+    exact same agent (with safety supervisor, dialogue/planner split, etc.)."""
     host = os.environ.get("ROS_BRIDGE_HOST", "192.168.1.103")
     cam_port = int(os.environ.get("ROS_BRIDGE_PORT", "9090"))
     motion_port = int(os.environ.get("ROS2_BRIDGE_PORT", "9091"))
+
     print(f"[voice] connecting to camera bridge ws://{host}:{cam_port} …", file=sys.stderr)
     _robot_state["robot"] = Lite3Robot(host=host, port=cam_port)
+
     try:
-        _robot_state["motion"] = Lite3Motion(host=host, port=motion_port)
-        print("[voice] motion bridge ok", file=sys.stderr)
+        print(f"[voice] connecting to ROS 2 bridge ws://{host}:{motion_port} …", file=sys.stderr)
+        _robot_state["ros2_client"] = connect_ros2_rosbridge(host, motion_port)
     except Exception as e:
-        print(f"[voice] motion bridge unavailable: {e}", file=sys.stderr)
+        print(f"[voice] ROS 2 bridge unavailable: {e}", file=sys.stderr)
+
+    ros2 = _robot_state["ros2_client"]
+    if ros2 is not None:
+        for name, cls in (("motion", Lite3Motion), ("follow", Lite3Follow), ("basic_goal", Lite3BasicGoal)):
+            try:
+                _robot_state[name] = cls(ros_client=ros2)
+                print(f"[voice] {name} adapter connected", file=sys.stderr)
+            except Exception as e:
+                print(f"[voice] {name} adapter failed: {e}", file=sys.stderr)
+
+    if not _USE_NEW_PIPELINE:
+        print("[voice] LEGACY_LOOP=1 — using old run_once agent", file=sys.stderr)
+        return
+
     try:
-        _robot_state["follow"] = Lite3Follow(host=host, port=motion_port)
-        print("[voice] follow tracker ok", file=sys.stderr)
+        memory = MemoryStore()
+        safety = SafetySupervisor(memory)
+        vlm = make_vlm_client()
+        ctx = ToolContext(
+            memory=memory,
+            robot=_robot_state["robot"],
+            motion=_robot_state["motion"],
+            follow=_robot_state["follow"],
+            basic_goal=_robot_state["basic_goal"],
+            vlm=vlm,
+            safety=safety,
+        )
+        registry = build_registry()
+        oa_client = _make_agent_client() if _use_openai_compat() else None
+        dialogue = DialogueAgent(oa_client)
+        planner = PlannerAgent(registry, ctx, client=oa_client)
+        _robot_state["orchestrator"] = Orchestrator(dialogue, planner, memory)
+        backend = "openai-compat" if oa_client else "bedrock-boto3"
+        print(f"[voice] new pipeline ready [{backend}]", file=sys.stderr)
     except Exception as e:
-        print(f"[voice] follow tracker unavailable: {e}", file=sys.stderr)
+        print(f"[voice] new pipeline init failed: {e} — falling back to legacy run_once", file=sys.stderr)
+        _robot_state["orchestrator"] = None
 
 
 # -------------- whisper (lazy load) -------------------------------------------
@@ -245,6 +311,22 @@ function add(role, text, meta) {
   return div;
 }
 
+function pickRecordMime() {
+  // iOS Safari only does audio/mp4. Chrome/Firefox do audio/webm + opus.
+  // Try the most-compatible options in order; return the first the browser
+  // says it supports. MediaRecorder will refuse to start with a bogus type.
+  const candidates = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4;codecs=mp4a.40.2',  // AAC-LC
+    'audio/mp4',
+  ];
+  for (const t of candidates) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return '';  // let the browser default
+}
+
 async function startRecording() {
   if (!navigator.mediaDevices) {
     setStatus('browser has no audio recording', 'error');
@@ -253,13 +335,18 @@ async function startRecording() {
   try {
     setStatus('asking for mic permission…', 'busy');
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    mediaRecorder = new MediaRecorder(stream);
+    const mimeType = pickRecordMime();
+    mediaRecorder = mimeType
+      ? new MediaRecorder(stream, { mimeType })
+      : new MediaRecorder(stream);
     chunks = [];
     mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
     mediaRecorder.onstop = async () => {
-      const blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+      const type = mediaRecorder.mimeType || 'audio/webm';
+      const ext = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm';
+      const blob = new Blob(chunks, { type });
       stream.getTracks().forEach(t => t.stop());
-      await sendAudio(blob);
+      await sendAudio(blob, ext);
     };
     mediaRecorder.start();
     ptt.classList.add('recording');
@@ -276,10 +363,10 @@ function stopRecording() {
   ptt.textContent = 'hold to talk';
 }
 
-async function sendAudio(blob) {
+async function sendAudio(blob, ext) {
   setStatus('transcribing…', 'busy');
   const fd = new FormData();
-  fd.append('audio', blob, 'clip.webm');
+  fd.append('audio', blob, 'clip.' + (ext || 'webm'));
   const res = await fetch('/talk', { method: 'POST', body: fd });
   if (!res.ok) {
     setStatus('error ' + res.status, 'error');
@@ -339,6 +426,35 @@ def index():
     return resp
 
 
+_MIME_TO_SUFFIX = {
+    "audio/webm": ".webm",
+    "audio/ogg": ".ogg",
+    "audio/mp4": ".m4a",
+    "audio/mpeg": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/aac": ".aac",
+}
+
+
+def _guess_suffix(mime: str | None, filename: str | None) -> str:
+    """Pick a file extension Whisper / ffmpeg will recognize.
+
+    Browser tells us the real container in the MIME type. iOS Safari sends
+    audio/mp4; desktop Chrome and Android send audio/webm. We honor that;
+    the filename suffix is unreliable.
+    """
+    if mime:
+        base = mime.split(";")[0].strip().lower()
+        if base in _MIME_TO_SUFFIX:
+            return _MIME_TO_SUFFIX[base]
+    if filename:
+        ext = os.path.splitext(filename)[1].lower()
+        if ext:
+            return ext
+    return ".webm"
+
+
 @app.route("/talk", methods=["POST"])
 def talk():
     t_req = time.time()
@@ -346,15 +462,26 @@ def talk():
     if audio is None:
         return ("missing audio", 400)
 
-    suffix = os.path.splitext(audio.filename or "")[1] or ".webm"
+    suffix = _guess_suffix(audio.mimetype, audio.filename)
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
         audio.save(f.name)
         wav_path = f.name
     upload_kb = os.path.getsize(wav_path) / 1024
+    print(
+        f"[voice] upload mime={audio.mimetype!r} name={audio.filename!r} "
+        f"saved-as {suffix} ({upload_kb:.0f}KB)",
+        file=sys.stderr,
+    )
     t_recv = time.time()
     try:
         transcript = whisper_transcribe(wav_path)
-    finally:
+    except Exception as e:
+        try:
+            os.unlink(wav_path)
+        except Exception:
+            pass
+        return jsonify({"transcript": "", "reply": f"(STT failed: {e})"}), 500
+    else:
         try:
             os.unlink(wav_path)
         except Exception:
@@ -373,12 +500,16 @@ def talk():
 
     with _robot_state["lock"]:
         try:
-            reply = run_once(
-                transcript,
-                _robot_state["robot"],
-                _robot_state["motion"],
-                _robot_state["follow"],
-            )
+            orch = _robot_state.get("orchestrator")
+            if orch is not None:
+                reply = orch.run(transcript)
+            else:
+                reply = run_once(
+                    transcript,
+                    _robot_state["robot"],
+                    _robot_state["motion"],
+                    _robot_state["follow"],
+                )
         except Exception as e:
             reply = f"(agent error: {type(e).__name__}: {e})"
     t_agent = time.time()
