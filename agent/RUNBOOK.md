@@ -1,177 +1,141 @@
 # Bringup runbook
 
-Step-by-step to get the agent talking to the Lite3 from a cold start.
-Follow in order — each step has a one-line "did it work?" check.
+Cold-start sequence. ~5 min when nothing has gone weird.
 
-## What you need next to you
+## Pre-flight
 
 - Laptop on the **robot's WiFi** (gives you `192.168.2.x`)
-- Phone tethered for **internet** (so Bedrock works)
-- The Lite3 powered on
-- `agent/.env` already has the Bedrock token + model from yesterday
+- Phone tethered for **internet** (Bedrock needs it)
+- The Lite3 powered on, dog standing in walk mode, **Auto Mode ON in the DeepRobotics app** (motion won't work without this)
+- `agent/.env` has the `AWS_BEARER_TOKEN_BEDROCK` (rotate if expired — bearer tokens last ~12h)
+- **Don't connect the EPFL VPN** — it hijacks the route to the robot
 
----
-
-## 1. Laptop: route the robot subnet through the WiFi gateway
-
-The robot's perception host is on `192.168.1.103`, but your laptop is on `192.168.2.x`. Add a route:
+## 1. Laptop — route to the robot subnet
 
 ```
 sudo route -n add 192.168.1.0/24 192.168.2.1
 ```
 
-**Check:** `ping -c 2 192.168.1.103` → should get replies.
+**Verify:** `ping -c 2 192.168.1.103` → replies. If "Can't assign requested address" later, the route was wiped (sleep / WiFi bounce). Just re-run.
 
-If you see "Can't assign requested address" later, the route was wiped (sleep / VPN / WiFi bounce). Just re-run the command.
-
-**Do NOT connect the EPFL VPN** — it hijacks the route and breaks robot access. Bedrock is on the public internet, you don't need the VPN.
-
----
-
-## 2. Robot: SSH in
+## 2. Robot terminal A — start camera
 
 ```
 ssh ysc@192.168.1.103
-```
-
-Password is `'` (a single quote).
-
-**Check:** you see `ysc@lite:~$`.
-
----
-
-## 3. Robot: confirm the camera is publishing
-
-```
-source /opt/ros/noetic/setup.bash
-rostopic list | grep image_raw
-```
-
-**Check:** you see `/camera/color/image_raw` and `/camera/depth/image_rect_raw`.
-
-If empty, the realsense service isn't running. Start it:
-
-```
 sudo systemctl restart realsense
-sleep 5
-rostopic list | grep image_raw
+sleep 8
+source /opt/ros/noetic/setup.bash
+timeout 5 rostopic hz /camera/color/image_raw
 ```
 
----
+**Expect** ~30 Hz. If empty → camera failed; check `lsusb | grep -i intel` — if nothing, the USB cable is loose, ask someone to reseat it.
 
-## 4. Robot: launch rosbridge
+You can `exit` this terminal once it's working — realsense runs as a service.
 
-In the same SSH terminal (must already be sourced from step 3):
+## 3. Robot terminal B — noetic rosbridge (camera)
 
 ```
+ssh ysc@192.168.1.103
+source /opt/ros/noetic/setup.bash
 roslaunch rosbridge_server rosbridge_websocket.launch
 ```
 
-**Check:** the last log line says `Rosbridge WebSocket server started at ws://0.0.0.0:9090`.
+**Wait for** `Rosbridge WebSocket server started at ws://0.0.0.0:9090`. Leave open.
 
-**Leave this terminal open.** If you close it, rosbridge dies and the laptop can't talk to the robot.
+## 4. Robot terminal C — foxy rosbridge (motion + follow)
 
----
+**Open a fresh SSH session — don't reuse a terminal you sourced noetic in.**
 
-## 5. Laptop: confirm the bridge is reachable
+```
+ssh ysc@192.168.1.103
+source /opt/ros/foxy/setup.bash
+ros2 launch rosbridge_server rosbridge_websocket_launch.xml port:=9091
+```
 
-In a *new* laptop terminal:
+**Wait for** `port 9091`. Leave open.
+
+## 5. Laptop — verify both bridges
 
 ```
 nc -vz 192.168.1.103 9090
+nc -vz 192.168.1.103 9091
 ```
 
-**Check:** "succeeded".
+Both should say "succeeded".
 
-If "Connection refused" → step 4 didn't actually start (look at the SSH terminal for errors).
-If "Can't assign requested address" → the route from step 1 is gone; re-add it.
-
----
-
-## 6. Laptop: smoke-test camera (optional but recommended)
+## 6. Laptop — run the agent (perception + motion only)
 
 ```
 cd /Users/maria/Desktop/RoboHack/agent
 source .venv/bin/activate
-python scripts/grab_frame.py
-```
-
-**Check:** prints `saved frame_rgb.jpg` and a depth summary, no traceback. Open `frame_rgb.jpg` to confirm it's a real photo from the robot.
-
----
-
-## 7. Laptop: smoke-test Bedrock (optional)
-
-```
-python3 -c "
-import os
-from dotenv import load_dotenv
-load_dotenv()
-import boto3
-c = boto3.client('bedrock-runtime', region_name=os.environ['AWS_REGION'])
-r = c.converse(
-    modelId=os.environ['BEDROCK_MODEL_ID'],
-    messages=[{'role':'user','content':[{'text':'say hello'}]}],
-    inferenceConfig={'maxTokens':20},
-)
-print(r['output']['message']['content'][0]['text'])
-"
-```
-
-**Check:** prints a hello.
-
-If "Invalid API Key format" → the Bedrock bearer token in `.env` is missing or malformed.
-If "AccessDeniedException ... explicit deny" → the model in `BEDROCK_MODEL_ID` isn't entitled to your role. Currently working: `us.anthropic.claude-sonnet-4-6`.
-If DNS error → phone tether is off, no internet.
-
----
-
-## 8. Laptop: run the agent
-
-```
 python cli.py
 ```
 
-**Check:** `connecting to rosbridge ws://192.168.1.103:9090 …` then `connected. type a question`.
+You'll see four "connecting" lines. The fourth one (follow tracker) will succeed at TCP level even though the tracker isn't running — `list_people` will return "no people detected" until step 8.
 
-Try a real perception question (must mention seeing/looking, otherwise the model just chats):
-
+Smoke-test:
 ```
-> what do you see in front of you?
-```
-
-You should see in stderr:
-```
-  → tool: describe_scene({})
-  ← <Claude's description of the actual frame>
+> what do you see?
+> walk forward briefly
 ```
 
-Then the answer prints to stdout.
+If the camera works and the dog walks, perception + motion are good.
 
----
+## 7. (Optional) Robot terminal D — start the follow tracker
 
-## Quick reference: what's in the project
+**Only do this if you need the follow-me feature.** The tracker takes ~40s to warm up (TensorRT). It also seems to occasionally make realsense flake — see "Known issues" below.
 
-- [cli.py](cli.py) — agent loop
-- [robot/lite3.py](robot/lite3.py) — rosbridge subscriber for camera, depth, pose
-- [tools/perception.py](tools/perception.py) — tools the LLM can call
-- [vlm.py](vlm.py) — Bedrock client wrapper
-- [scripts/grab_frame.py](scripts/grab_frame.py) — direct frame test, no agent
+**Fresh SSH session — must NOT have noetic sourced first.**
 
-## Tomorrow's open work
+```
+ssh ysc@192.168.1.103
+source /opt/ros/foxy/setup.bash
+cd /home/ysc/lite_cog_ros2/track/src
+python3 run_tracker.py
+```
 
-- **`/leg_odom` and `/cmd_vel`** are on ROS 2 (foxy), not ROS 1 (noetic). Current rosbridge is noetic, so `get_pose` returns null and we can't drive yet.
-- Fix: install `ros-foxy-rosbridge-server` on the robot (needs the robot to have internet — quickest path is putting the robot on your phone's hotspot for 2 minutes), launch it on a different port (9091), add a second `Lite3Robot` connection in the code for the foxy graph.
-- After that: add `walk_forward` / `turn` / `stop` tools that publish to `/cmd_vel`.
+**Wait for** `[tracker] running. window=False. publishing /agent/* topics.` — that's the new windowless mode. Until you see that line, the tracker is still loading YOLO.
 
-## When things go wrong mid-session
+If you want the visual debugging window (XQuartz on Mac):
+```
+ssh -Y ysc@192.168.1.103
+TRACKER_SHOW_WINDOW=1 python3 run_tracker.py
+```
+
+## 8. Test the follow flow from the agent
+
+Stand in front of the dog (~1–3 m). Then in the agent prompt:
+
+```
+> follow me
+```
+
+Watch stderr — you should see:
+```
+  → tool: list_people({})
+  ← {"yolo_ids": [1], "vlm_descriptions_raw": "..."}
+  → tool: follow_person({"yolo_id": 1})
+```
+
+Then:
+```
+> stop following
+```
+
+## Known issues
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `Failed to connect to ROS` | rosbridge died | SSH in, redo step 4 |
+| Camera dies (`No RealSense devices were found`) | RealSense USB flake. Sometimes correlated with tracker running. | `sudo systemctl restart realsense`; if persistent, reseat USB cable |
+| `Failed to connect to ROS` | rosbridge died (terminal closed) | redo step 3 or 4 |
 | `Can't assign requested address` | route gone | redo step 1 |
-| `Connection refused` on 9090 | rosbridge not running | step 4 |
-| `nodename ... not known` | no internet | check phone tether |
-| `Invalid API Key format` | bad bearer token | check `.env` |
-| `explicit deny` | model not entitled | use `us.anthropic.claude-sonnet-4-6` |
-| Agent answers but never calls a tool | question too generic | mention "see"/"look"/"in front" so the model invokes `describe_scene` |
+| `Connection refused` on 9090/9091 | rosbridge not running | step 3 / step 4 |
+| `Invalid API Key format` | Bedrock bearer token expired | get new token, update `.env` |
+| `explicit deny` on Bedrock | Model not entitled | use `us.anthropic.claude-sonnet-4-6` |
+| `_TYPE_SUPPORT` error launching tracker | mixed noetic + foxy in shell | open fresh SSH, source only foxy |
+| Dog doesn't move on `/cmd_vel` | Auto Mode not on, or not in walk mode | use the DeepRobotics app to enable Auto Mode + stand |
+| Tracker hangs at `BLOCKING MODE` | Just warming up | wait 40s for TensorRT |
+
+## Rotating the Bedrock token
+
+Bearer tokens expire in ~12h. When you see `Authentication failed: Please make sure your API Key is valid.`, get a fresh one and update [agent/.env](.env). Don't paste the token in chat / commits.
