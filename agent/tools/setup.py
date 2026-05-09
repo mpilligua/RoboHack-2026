@@ -9,9 +9,6 @@ def build_registry() -> ToolRegistry:
 
     # Safety tools
     reg.register("stop", safety_tools.handle_stop, [CALLER_PLANNER, CALLER_OPERATOR])
-    reg.register("emergency_stop", safety_tools.handle_emergency_stop, [CALLER_PLANNER, CALLER_OPERATOR])
-    reg.register("reset_emergency_stop", safety_tools.handle_reset_emergency_stop, [CALLER_OPERATOR])
-    reg.register("check_safety", safety_tools.handle_check_safety, [CALLER_PLANNER, CALLER_OPERATOR])
     reg.register("get_robot_status", safety_tools.handle_get_robot_status, [CALLER_PLANNER, CALLER_OPERATOR])
 
     # Perception tools
@@ -27,7 +24,11 @@ def build_registry() -> ToolRegistry:
     reg.register("resolve_reference", memory_tools.handle_resolve_reference, [CALLER_PLANNER])
     reg.register("find_objects_matching_constraints", memory_tools.handle_find_objects_matching_constraints, [CALLER_PLANNER])
 
-    # Motion tools (stop only; goal-based motion replaces walk/turn)
+    # Motion tools
+    reg.register("walk_forward", motion_tools.handle_walk_forward, [CALLER_PLANNER])
+    reg.register("walk_backward", motion_tools.handle_walk_backward, [CALLER_PLANNER])
+    reg.register("turn_left", motion_tools.handle_turn_left, [CALLER_PLANNER])
+    reg.register("turn_right", motion_tools.handle_turn_right, [CALLER_PLANNER])
     reg.register("stop_motion", motion_tools.handle_stop_motion, [CALLER_PLANNER, CALLER_OPERATOR])
 
     # Basic goal + low-level command tools
@@ -35,7 +36,6 @@ def build_registry() -> ToolRegistry:
         "send_basic_goal",
         basic_goal_tools.handle_send_basic_goal,
         [CALLER_PLANNER],
-        requires_motion_safety=True,
     )
     reg.register(
         "cancel_basic_goal",
@@ -52,22 +52,12 @@ def build_registry() -> ToolRegistry:
         basic_goal_tools.handle_get_ros2_odom,
         [CALLER_PLANNER, CALLER_OPERATOR],
     )
-    reg.register(
-        "send_simple_cmd",
-        basic_goal_tools.handle_send_simple_cmd,
-        [CALLER_PLANNER],
-        requires_motion_safety=True,
-    )
-    reg.register(
-        "send_complex_cmd",
-        basic_goal_tools.handle_send_complex_cmd,
-        [CALLER_PLANNER],
-        requires_motion_safety=True,
-    )
+    reg.register("send_simple_cmd", basic_goal_tools.handle_send_simple_cmd, [CALLER_PLANNER])
+    reg.register("send_complex_cmd", basic_goal_tools.handle_send_complex_cmd, [CALLER_PLANNER])
 
     # Follow tools
-    reg.register("follow_person", follow_tools.handle_follow_person, [CALLER_PLANNER], requires_forward_safety=True)
-    reg.register("go_to_object", follow_tools.handle_go_to_object, [CALLER_PLANNER], requires_forward_safety=True)
+    reg.register("follow_person", follow_tools.handle_follow_person, [CALLER_PLANNER])
+    reg.register("go_to_object", follow_tools.handle_go_to_object, [CALLER_PLANNER])
     reg.register("stop_tracking", follow_tools.handle_stop_tracking, [CALLER_PLANNER, CALLER_OPERATOR])
 
     return reg

@@ -14,14 +14,8 @@ from tools.registry import CALLER_PLANNER, ToolRegistry
 _SPECS = [
     ("stop", "Stop all robot motion and tracking immediately.", {}, []),
     (
-        "emergency_stop",
-        "Trigger emergency stop and latch it. All motion is blocked until reset_emergency_stop is called.",
-        {}, [],
-    ),
-    ("check_safety", "Check if it is safe to move forward. Returns safe=true/false and reason.", {}, []),
-    (
         "get_robot_status",
-        "Get robot connection status and depth summary. Refreshes safety supervisor depth data.",
+        "Get robot connection status and depth summary.",
         {}, [],
     ),
     (
@@ -36,12 +30,7 @@ _SPECS = [
         {"item_description": {"type": "string", "description": "Which item to read, e.g. 'the red can'."}},
         ["item_description"],
     ),
-    (
-        "get_rgbd_summary",
-        "Return depth statistics (min, center, median, valid_fraction). "
-        "Updates safety supervisor — call before walking forward.",
-        {}, [],
-    ),
+    ("get_rgbd_summary", "Return depth statistics (min, center, median, valid_fraction).", {}, []),
     (
         "get_depth_at_pixel",
         "Get approximate depth at a specific RGB pixel (u, v).",
@@ -81,6 +70,42 @@ _SPECS = [
             "min_depth_m": {"type": "number"},
         },
         [],
+    ),
+    (
+        "walk_forward",
+        "Walk forward a given distance in meters.",
+        {
+            "distance_m": {"type": "number", "description": "Distance to walk forward (meters)."},
+            "speed": {"type": "number", "description": "Speed in m/s (default 0.15, max 0.3)."},
+        },
+        ["distance_m"],
+    ),
+    (
+        "walk_backward",
+        "Walk backward a given distance in meters.",
+        {
+            "distance_m": {"type": "number", "description": "Distance to walk backward (meters)."},
+            "speed": {"type": "number", "description": "Speed in m/s (default 0.15)."},
+        },
+        ["distance_m"],
+    ),
+    (
+        "turn_left",
+        "Rotate left (counter-clockwise) by a given angle.",
+        {
+            "angle_deg": {"type": "number", "description": "Angle to rotate in degrees."},
+            "omega": {"type": "number", "description": "Angular speed in rad/s (default 0.4)."},
+        },
+        ["angle_deg"],
+    ),
+    (
+        "turn_right",
+        "Rotate right (clockwise) by a given angle.",
+        {
+            "angle_deg": {"type": "number", "description": "Angle to rotate in degrees."},
+            "omega": {"type": "number", "description": "Angular speed in rad/s (default 0.4)."},
+        },
+        ["angle_deg"],
     ),
     ("stop_motion", "Stop all robot motion without stopping the tracker.", {}, []),
     (

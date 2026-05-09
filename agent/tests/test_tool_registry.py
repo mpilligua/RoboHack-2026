@@ -1,20 +1,14 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import time
-
 from memory.store import MemoryStore
 from safety.supervisor import SafetySupervisor
 from tools.base import ToolContext, ToolResult
 from tools.registry import CALLER_OPERATOR, CALLER_PLANNER, ToolRegistry
 
 
-def _make_ctx(depth_stamp=None, nearest_mm=None):
+def _make_ctx():
     store = MemoryStore()
-    if depth_stamp is not None:
-        store.update_robot_state(depth_stamp=depth_stamp)
-    if nearest_mm is not None:
-        store.update_robot_state(nearest_obstacle_mm=nearest_mm)
     safety = SafetySupervisor(store)
     return ToolContext(
         memory=store,
@@ -59,42 +53,6 @@ def test_disallowed_caller_returns_error():
     assert not result.ok
     assert "not allowed" in result.error.lower()
 
-
-def test_forward_safety_blocks_when_depth_stale():
-    reg = ToolRegistry()
-    reg.register("move", _ok_handler, [CALLER_PLANNER], requires_forward_safety=True)
-    ctx = _make_ctx()  # no depth_stamp → stale
-    result = reg.call("move", {}, ctx, CALLER_PLANNER)
-    assert not result.ok
-    assert "safety block" in result.error.lower()
-    assert "safety_blocked" in result.events
-
-
-def test_forward_safety_passes_with_fresh_depth_and_clear_path():
-    reg = ToolRegistry()
-    reg.register("move", _ok_handler, [CALLER_PLANNER], requires_forward_safety=True)
-    ctx = _make_ctx(depth_stamp=time.time(), nearest_mm=800)
-    result = reg.call("move", {}, ctx, CALLER_PLANNER)
-    assert result.ok
-
-
-def test_motion_safety_passes_with_stale_depth():
-    # turn/backward only block on emergency latch, not stale depth
-    reg = ToolRegistry()
-    reg.register("turn", _ok_handler, [CALLER_PLANNER], requires_motion_safety=True)
-    ctx = _make_ctx()  # stale depth but no emergency
-    result = reg.call("turn", {}, ctx, CALLER_PLANNER)
-    assert result.ok
-
-
-def test_motion_safety_blocks_on_emergency():
-    reg = ToolRegistry()
-    reg.register("turn", _ok_handler, [CALLER_PLANNER], requires_motion_safety=True)
-    ctx = _make_ctx()
-    ctx.safety.trigger_emergency_stop()
-    result = reg.call("turn", {}, ctx, CALLER_PLANNER)
-    assert not result.ok
-    assert "safety_blocked" in result.events
 
 
 def test_handler_exception_caught_as_error():

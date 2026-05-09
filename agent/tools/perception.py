@@ -112,56 +112,61 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         {},
     ),
     _spec(
-        "walk_forward",
-        (
-            "Walk the robot forward for a short duration. The robot must "
-            "already be standing in walk mode with auto mode enabled. "
-            "Always describe what you see first if there's any chance of "
-            "obstacles ahead. Speed is clamped to 0.3 m/s, duration to 2 s."
-        ),
-        {
-            "duration_s": {
-                "type": "number",
-                "description": "How long to walk, in seconds. Try 0.5 to 2.",
-            },
-            "speed": {
-                "type": "number",
-                "description": "Forward speed in m/s, default 0.15.",
-            },
-        },
-        required=["duration_s"],
-    ),
-    _spec(
-        "walk_backward",
-        "Walk the robot backward for a short duration.",
-        {
-            "duration_s": {"type": "number"},
-            "speed": {"type": "number", "description": "m/s, default 0.15."},
-        },
-        required=["duration_s"],
-    ),
-    _spec(
-        "turn_left",
-        "Rotate the robot in place to the left (counter-clockwise).",
-        {
-            "duration_s": {"type": "number"},
-            "omega": {"type": "number", "description": "rad/s, default 0.4."},
-        },
-        required=["duration_s"],
-    ),
-    _spec(
-        "turn_right",
-        "Rotate the robot in place to the right (clockwise).",
-        {
-            "duration_s": {"type": "number"},
-            "omega": {"type": "number", "description": "rad/s, default 0.4."},
-        },
-        required=["duration_s"],
-    ),
-    _spec(
         "stop_motion",
         "Immediately stop all motion. Use as a safety command.",
         {},
+    ),
+    _spec(
+        "send_basic_goal",
+        (
+            "Send an absolute 2D goal (x, y, theta) in meters/radians to the "
+            "ROS2 basic_goal_controller. Use this for distance-based navigation."
+        ),
+        {
+            "x": {"type": "number", "description": "Goal x position in meters."},
+            "y": {"type": "number", "description": "Goal y position in meters."},
+            "theta": {"type": "number", "description": "Goal heading in radians."},
+        },
+        required=["x", "y", "theta"],
+    ),
+    _spec(
+        "cancel_basic_goal",
+        "Cancel the current basic goal.",
+        {"reason": {"type": "string", "description": "Optional cancel reason."}},
+    ),
+    _spec(
+        "get_basic_goal_status",
+        "Get the latest basic goal status; optionally wait for a specific status.",
+        {
+            "wait_for": {"type": "string", "description": "Target status to wait for."},
+            "timeout_s": {"type": "number", "description": "Max seconds to wait."},
+        },
+    ),
+    _spec(
+        "get_ros2_odom",
+        "Return latest ROS2 odometry pose: x, y, z, yaw.",
+        {},
+    ),
+    _spec(
+        "send_simple_cmd",
+        "Send low-level MotionSimpleCMD (cmd_code/size/type).",
+        {
+            "cmd_code": {"type": "integer"},
+            "size": {"type": "integer"},
+            "type": {"type": "integer"},
+        },
+        required=["cmd_code", "size", "type"],
+    ),
+    _spec(
+        "send_complex_cmd",
+        "Send low-level MotionComplexCMD (cmd_code/size/type/data).",
+        {
+            "cmd_code": {"type": "integer"},
+            "size": {"type": "integer"},
+            "type": {"type": "integer"},
+            "data": {"type": "number"},
+        },
+        required=["cmd_code", "size", "type", "data"],
     ),
     _spec(
         "list_visible_objects",
@@ -224,7 +229,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 ]
 
 
-def _describe_scene(robot, motion, follow, vlm, args: dict) -> str:
+def _describe_scene(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
     focus = args.get("focus") or "the scene"
     prompt = (
         f"You are the perception system of an assistive guide-dog robot at "
@@ -236,7 +241,7 @@ def _describe_scene(robot, motion, follow, vlm, args: dict) -> str:
     return vlm_describe(vlm, jpeg, prompt)
 
 
-def _read_label(robot, motion, follow, vlm, args: dict) -> str:
+def _read_label(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
     item = args["item_description"]
     prompt = (
         f"Read every piece of text visible on '{item}' in this image. "
@@ -247,11 +252,11 @@ def _read_label(robot, motion, follow, vlm, args: dict) -> str:
     return vlm_describe(vlm, jpeg, prompt)
 
 
-def _get_rgbd_summary(robot, motion, follow, vlm, args: dict) -> str:
+def _get_rgbd_summary(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
     return json.dumps(robot.depth_summary())
 
 
-def _get_depth_at_pixel(robot, motion, follow, vlm, args: dict) -> str:
+def _get_depth_at_pixel(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
     out = robot.depth_at_rgb_pixel_naive(
         int(args["u"]),
         int(args["v"]),
@@ -260,7 +265,7 @@ def _get_depth_at_pixel(robot, motion, follow, vlm, args: dict) -> str:
     return json.dumps(out)
 
 
-def _get_pose(robot, motion, follow, vlm, args: dict) -> str:
+def _get_pose(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
     pose = robot.get_pose()
     if pose is None:
         return json.dumps({"error": "no odometry yet"})
@@ -269,7 +274,7 @@ def _get_pose(robot, motion, follow, vlm, args: dict) -> str:
     )
 
 
-def _get_status(robot, motion, follow, vlm, args: dict) -> str:
+def _get_status(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
     import time
 
     now = time.time()
@@ -282,6 +287,7 @@ def _get_status(robot, motion, follow, vlm, args: dict) -> str:
             "rosbridge_connected": robot._client.is_connected,
             "motion_connected": motion is not None and motion._client.is_connected,
             "follow_connected": follow is not None and follow._client.is_connected,
+            "basic_goal_connected": basic_goal is not None and basic_goal._client.is_connected,
             "rgb_age_s": rgb_age,
             "depth_age_s": depth_age,
             "have_pose": pose is not None,
@@ -294,31 +300,7 @@ def _require_motion(motion):
         raise RuntimeError("motion adapter not connected — start the foxy rosbridge on port 9091")
 
 
-def _walk_forward(robot, motion, follow, vlm, args: dict) -> str:
-    _require_motion(motion)
-    motion.forward(speed=args.get("speed", 0.15), duration_s=args["duration_s"])
-    return json.dumps({"ok": True, "action": "walk_forward", "duration_s": args["duration_s"]})
-
-
-def _walk_backward(robot, motion, follow, vlm, args: dict) -> str:
-    _require_motion(motion)
-    motion.backward(speed=args.get("speed", 0.15), duration_s=args["duration_s"])
-    return json.dumps({"ok": True, "action": "walk_backward", "duration_s": args["duration_s"]})
-
-
-def _turn_left(robot, motion, follow, vlm, args: dict) -> str:
-    _require_motion(motion)
-    motion.turn_left(omega=args.get("omega", 0.4), duration_s=args["duration_s"])
-    return json.dumps({"ok": True, "action": "turn_left", "duration_s": args["duration_s"]})
-
-
-def _turn_right(robot, motion, follow, vlm, args: dict) -> str:
-    _require_motion(motion)
-    motion.turn_right(omega=args.get("omega", 0.4), duration_s=args["duration_s"])
-    return json.dumps({"ok": True, "action": "turn_right", "duration_s": args["duration_s"]})
-
-
-def _stop_motion(robot, motion, follow, vlm, args: dict) -> str:
+def _stop_motion(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
     _require_motion(motion)
     motion.stop()
     return json.dumps({"ok": True, "action": "stop"})
@@ -331,7 +313,7 @@ def _require_follow(follow):
         )
 
 
-def _list_visible_objects(robot, motion, follow, vlm, args: dict) -> str:
+def _list_visible_objects(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
     _require_follow(follow)
     dets = follow.get_detections()
     if not dets:
@@ -370,7 +352,7 @@ def _list_visible_objects(robot, motion, follow, vlm, args: dict) -> str:
     )
 
 
-def _follow_person(robot, motion, follow, vlm, args: dict) -> str:
+def _follow_person(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
     _require_follow(follow)
     follow.follow(int(args["yolo_id"]))
     return json.dumps(
@@ -378,7 +360,7 @@ def _follow_person(robot, motion, follow, vlm, args: dict) -> str:
     )
 
 
-def _go_to_object(robot, motion, follow, vlm, args: dict) -> str:
+def _go_to_object(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
     _require_follow(follow)
     import threading
     import time as _time
@@ -438,10 +420,70 @@ def _go_to_object(robot, motion, follow, vlm, args: dict) -> str:
     )
 
 
-def _stop_tracking(robot, motion, follow, vlm, args: dict) -> str:
+def _stop_tracking(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
     _require_follow(follow)
     follow.stop()
     return json.dumps({"ok": True, "action": "stop_tracking"})
+
+
+def _require_basic_goal(basic_goal):
+    if basic_goal is None:
+        raise RuntimeError(
+            "basic goal adapter not connected — start the foxy rosbridge on port 9091"
+        )
+
+
+def _send_basic_goal(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
+    _require_basic_goal(basic_goal)
+    x = float(args["x"])
+    y = float(args["y"])
+    theta = float(args["theta"])
+    basic_goal.send_goal(x, y, theta)
+    return json.dumps({"ok": True, "action": "send_basic_goal", "x": x, "y": y, "theta": theta})
+
+
+def _cancel_basic_goal(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
+    _require_basic_goal(basic_goal)
+    reason = str(args.get("reason", "stop"))
+    basic_goal.cancel_goal(reason)
+    return json.dumps({"ok": True, "action": "cancel_basic_goal", "reason": reason})
+
+
+def _get_basic_goal_status(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
+    _require_basic_goal(basic_goal)
+    wait_for = args.get("wait_for")
+    timeout_s = args.get("timeout_s")
+    if wait_for is not None and timeout_s is None:
+        timeout_s = 5.0
+    status = basic_goal.get_status(wait_for=wait_for, timeout_s=timeout_s)
+    if status.get("status") is None:
+        status["note"] = "no status yet"
+    return json.dumps(status)
+
+
+def _get_ros2_odom(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
+    _require_basic_goal(basic_goal)
+    odom = basic_goal.get_odom()
+    if odom is None:
+        return json.dumps({"note": "no odom yet"})
+    return json.dumps(odom)
+
+
+def _send_simple_cmd(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
+    _require_basic_goal(basic_goal)
+    basic_goal.send_simple_cmd(int(args["cmd_code"]), int(args["size"]), int(args["type"]))
+    return json.dumps({"ok": True, "action": "send_simple_cmd"})
+
+
+def _send_complex_cmd(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
+    _require_basic_goal(basic_goal)
+    basic_goal.send_complex_cmd(
+        int(args["cmd_code"]),
+        int(args["size"]),
+        int(args["type"]),
+        float(args["data"]),
+    )
+    return json.dumps({"ok": True, "action": "send_complex_cmd"})
 
 
 _HANDLERS = {
@@ -451,23 +493,25 @@ _HANDLERS = {
     "get_depth_at_pixel": _get_depth_at_pixel,
     "get_pose": _get_pose,
     "get_status": _get_status,
-    "walk_forward": _walk_forward,
-    "walk_backward": _walk_backward,
-    "turn_left": _turn_left,
     "list_visible_objects": _list_visible_objects,
     "follow_person": _follow_person,
     "go_to_object": _go_to_object,
     "stop_tracking": _stop_tracking,
-    "turn_right": _turn_right,
     "stop_motion": _stop_motion,
+    "send_basic_goal": _send_basic_goal,
+    "cancel_basic_goal": _cancel_basic_goal,
+    "get_basic_goal_status": _get_basic_goal_status,
+    "get_ros2_odom": _get_ros2_odom,
+    "send_simple_cmd": _send_simple_cmd,
+    "send_complex_cmd": _send_complex_cmd,
 }
 
 
-def dispatch(name: str, args: dict, robot, motion, follow, vlm) -> str:
+def dispatch(name: str, args: dict, robot, motion, follow, basic_goal, vlm) -> str:
     handler = _HANDLERS.get(name)
     if handler is None:
         return json.dumps({"error": f"unknown tool: {name}"})
     try:
-        return handler(robot, motion, follow, vlm, args)
+        return handler(robot, motion, follow, basic_goal, vlm, args)
     except Exception as e:
         return json.dumps({"error": f"{type(e).__name__}: {e}"})

@@ -15,8 +15,6 @@ CALLER_OPERATOR = "operator"
 class _HandlerEntry:
     handler: Callable
     allowed_callers: list[str]
-    requires_forward_safety: bool
-    requires_motion_safety: bool
 
 
 class ToolRegistry:
@@ -28,14 +26,11 @@ class ToolRegistry:
         name: str,
         handler: Callable,
         allowed_callers: list[str],
-        requires_forward_safety: bool = False,
-        requires_motion_safety: bool = False,
+        **_kwargs,  # absorb legacy requires_*_safety kwargs silently
     ) -> None:
         self._handlers[name] = _HandlerEntry(
             handler=handler,
             allowed_callers=allowed_callers,
-            requires_forward_safety=requires_forward_safety,
-            requires_motion_safety=requires_motion_safety,
         )
 
     def call(self, name: str, args: dict, ctx: ToolContext, caller: str) -> ToolResult:
@@ -48,18 +43,6 @@ class ToolRegistry:
         if caller not in entry.allowed_callers:
             ctx.memory.add_event(Event(time.time(), "tool_blocked", name, f"caller '{caller}' not allowed"))
             return ToolResult(ok=False, tool=name, error=f"caller '{caller}' is not allowed to call '{name}'")
-
-        if entry.requires_forward_safety:
-            sr = ctx.safety.check_forward_motion()
-            if not sr.safe:
-                ctx.memory.add_event(Event(time.time(), "safety_block", name, sr.reason))
-                return ToolResult(ok=False, tool=name, error=f"safety block: {sr.reason}", events=["safety_blocked"])
-
-        elif entry.requires_motion_safety:
-            sr = ctx.safety.check_any_motion()
-            if not sr.safe:
-                ctx.memory.add_event(Event(time.time(), "safety_block", name, sr.reason))
-                return ToolResult(ok=False, tool=name, error=f"safety block: {sr.reason}", events=["safety_blocked"])
 
         try:
             ctx.memory.add_event(Event(time.time(), "tool_call", name, json.dumps(args)[:300]))

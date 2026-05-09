@@ -22,25 +22,6 @@ def handle_stop(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult(ok=True, tool="stop", result={"action": "stop"})
 
 
-def handle_emergency_stop(ctx: ToolContext, args: dict) -> ToolResult:
-    ctx.safety.trigger_emergency_stop()
-    handle_stop(ctx, {})
-    return ToolResult(ok=True, tool="emergency_stop", result={"action": "emergency_stop", "latched": True})
-
-
-def handle_reset_emergency_stop(ctx: ToolContext, args: dict) -> ToolResult:
-    ctx.safety.reset_emergency_stop()
-    return ToolResult(ok=True, tool="reset_emergency_stop", result={"action": "reset_emergency_stop", "latched": False})
-
-
-def handle_check_safety(ctx: ToolContext, args: dict) -> ToolResult:
-    sr = ctx.safety.check_forward_motion()
-    return ToolResult(
-        ok=True,
-        tool="check_safety",
-        result={"safe": sr.safe, "reason": sr.reason},
-    )
-
 
 def handle_get_robot_status(ctx: ToolContext, args: dict) -> ToolResult:
     try:
