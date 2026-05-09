@@ -117,6 +117,53 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         {},
     ),
     _spec(
+        "walk_forward",
+        (
+            "Walk the robot forward for a short duration. The robot must "
+            "already be standing in walk mode with auto mode enabled. "
+            "Always describe what you see first if there's any chance of "
+            "obstacles ahead. Speed is clamped to 0.3 m/s, duration to 2 s."
+        ),
+        {
+            "duration_s": {
+                "type": "number",
+                "description": "How long to walk, in seconds. Try 0.5 to 2.",
+            },
+            "speed": {
+                "type": "number",
+                "description": "Forward speed in m/s, default 0.15.",
+            },
+        },
+        required=["duration_s"],
+    ),
+    _spec(
+        "walk_backward",
+        "Walk the robot backward for a short duration.",
+        {
+            "duration_s": {"type": "number"},
+            "speed": {"type": "number", "description": "m/s, default 0.15."},
+        },
+        required=["duration_s"],
+    ),
+    _spec(
+        "turn_left",
+        "Rotate the robot in place to the left (counter-clockwise).",
+        {
+            "duration_s": {"type": "number"},
+            "omega": {"type": "number", "description": "rad/s, default 0.4."},
+        },
+        required=["duration_s"],
+    ),
+    _spec(
+        "turn_right",
+        "Rotate the robot in place to the right (clockwise).",
+        {
+            "duration_s": {"type": "number"},
+            "omega": {"type": "number", "description": "rad/s, default 0.4."},
+        },
+        required=["duration_s"],
+    ),
+    _spec(
         "send_basic_goal",
         (
             "Send an absolute 2D goal (x, y, theta) in meters/radians to the "
@@ -304,6 +351,30 @@ def _stop_motion(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
     _require_motion(motion)
     motion.stop()
     return json.dumps({"ok": True, "action": "stop"})
+
+
+def _walk_forward(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
+    _require_motion(motion)
+    motion.forward(speed=args.get("speed", 0.15), duration_s=args["duration_s"])
+    return json.dumps({"ok": True, "action": "walk_forward", "duration_s": args["duration_s"]})
+
+
+def _walk_backward(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
+    _require_motion(motion)
+    motion.backward(speed=args.get("speed", 0.15), duration_s=args["duration_s"])
+    return json.dumps({"ok": True, "action": "walk_backward", "duration_s": args["duration_s"]})
+
+
+def _turn_left(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
+    _require_motion(motion)
+    motion.turn_left(omega=args.get("omega", 0.4), duration_s=args["duration_s"])
+    return json.dumps({"ok": True, "action": "turn_left", "duration_s": args["duration_s"]})
+
+
+def _turn_right(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
+    _require_motion(motion)
+    motion.turn_right(omega=args.get("omega", 0.4), duration_s=args["duration_s"])
+    return json.dumps({"ok": True, "action": "turn_right", "duration_s": args["duration_s"]})
 
 
 def _require_follow(follow):
@@ -498,6 +569,10 @@ _HANDLERS = {
     "go_to_object": _go_to_object,
     "stop_tracking": _stop_tracking,
     "stop_motion": _stop_motion,
+    "walk_forward": _walk_forward,
+    "walk_backward": _walk_backward,
+    "turn_left": _turn_left,
+    "turn_right": _turn_right,
     "send_basic_goal": _send_basic_goal,
     "cancel_basic_goal": _cancel_basic_goal,
     "get_basic_goal_status": _get_basic_goal_status,
