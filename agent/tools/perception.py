@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from robot import Lite3Motion, Lite3Robot
+from robot import Lite3Follow, Lite3Motion, Lite3Robot
 from vlm import vlm_describe
 
 
@@ -140,10 +140,40 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "Immediately stop all motion. Use as a safety command.",
         {},
     ),
+    _spec(
+        "list_people",
+        (
+            "Look at the live tracker view and return a description of each "
+            "detected person, keyed by their YOLO id. Use this when the user "
+            "wants to start following someone — call this first to figure "
+            "out which YOLO id matches the user's description (e.g. 'the "
+            "woman in red'). The tracker must be running."
+        ),
+        {},
+    ),
+    _spec(
+        "follow_person",
+        (
+            "Tell the tracker to follow a specific YOLO id. Get the id from "
+            "list_people first. The robot must be standing in walk mode."
+        ),
+        {
+            "yolo_id": {
+                "type": "integer",
+                "description": "The YOLO id of the person to follow.",
+            }
+        },
+        required=["yolo_id"],
+    ),
+    _spec(
+        "stop_following",
+        "Tell the tracker to stop following anyone.",
+        {},
+    ),
 ]
 
 
-def _describe_scene(robot: Lite3Robot, motion, vlm, args: dict) -> str:
+def _describe_scene(robot, motion, follow, vlm, args: dict) -> str:
     focus = args.get("focus") or "the scene"
     prompt = (
         f"You are the perception system of an assistive guide-dog robot at "
@@ -155,7 +185,7 @@ def _describe_scene(robot: Lite3Robot, motion, vlm, args: dict) -> str:
     return vlm_describe(vlm, jpeg, prompt)
 
 
-def _read_label(robot: Lite3Robot, motion, vlm, args: dict) -> str:
+def _read_label(robot, motion, follow, vlm, args: dict) -> str:
     item = args["item_description"]
     prompt = (
         f"Read every piece of text visible on '{item}' in this image. "
@@ -166,11 +196,11 @@ def _read_label(robot: Lite3Robot, motion, vlm, args: dict) -> str:
     return vlm_describe(vlm, jpeg, prompt)
 
 
-def _get_rgbd_summary(robot: Lite3Robot, motion, vlm, args: dict) -> str:
+def _get_rgbd_summary(robot, motion, follow, vlm, args: dict) -> str:
     return json.dumps(robot.depth_summary())
 
 
-def _get_pose(robot: Lite3Robot, motion, vlm, args: dict) -> str:
+def _get_pose(robot, motion, follow, vlm, args: dict) -> str:
     pose = robot.get_pose()
     if pose is None:
         return json.dumps({"error": "no odometry yet"})
@@ -179,7 +209,7 @@ def _get_pose(robot: Lite3Robot, motion, vlm, args: dict) -> str:
     )
 
 
-def _get_status(robot: Lite3Robot, motion, vlm, args: dict) -> str:
+def _get_status(robot, motion, follow, vlm, args: dict) -> str:
     import time
 
     now = time.time()
@@ -191,6 +221,7 @@ def _get_status(robot: Lite3Robot, motion, vlm, args: dict) -> str:
         {
             "rosbridge_connected": robot._client.is_connected,
             "motion_connected": motion is not None and motion._client.is_connected,
+            "follow_connected": follow is not None and follow._client.is_connected,
             "rgb_age_s": rgb_age,
             "depth_age_s": depth_age,
             "have_pose": pose is not None,
@@ -203,34 +234,89 @@ def _require_motion(motion):
         raise RuntimeError("motion adapter not connected — start the foxy rosbridge on port 9091")
 
 
-def _walk_forward(robot, motion, vlm, args: dict) -> str:
+def _walk_forward(robot, motion, follow, vlm, args: dict) -> str:
     _require_motion(motion)
     motion.forward(speed=args.get("speed", 0.15), duration_s=args["duration_s"])
     return json.dumps({"ok": True, "action": "walk_forward", "duration_s": args["duration_s"]})
 
 
-def _walk_backward(robot, motion, vlm, args: dict) -> str:
+def _walk_backward(robot, motion, follow, vlm, args: dict) -> str:
     _require_motion(motion)
     motion.backward(speed=args.get("speed", 0.15), duration_s=args["duration_s"])
     return json.dumps({"ok": True, "action": "walk_backward", "duration_s": args["duration_s"]})
 
 
-def _turn_left(robot, motion, vlm, args: dict) -> str:
+def _turn_left(robot, motion, follow, vlm, args: dict) -> str:
     _require_motion(motion)
     motion.turn_left(omega=args.get("omega", 0.4), duration_s=args["duration_s"])
     return json.dumps({"ok": True, "action": "turn_left", "duration_s": args["duration_s"]})
 
 
-def _turn_right(robot, motion, vlm, args: dict) -> str:
+def _turn_right(robot, motion, follow, vlm, args: dict) -> str:
     _require_motion(motion)
     motion.turn_right(omega=args.get("omega", 0.4), duration_s=args["duration_s"])
     return json.dumps({"ok": True, "action": "turn_right", "duration_s": args["duration_s"]})
 
 
-def _stop_motion(robot, motion, vlm, args: dict) -> str:
+def _stop_motion(robot, motion, follow, vlm, args: dict) -> str:
     _require_motion(motion)
     motion.stop()
     return json.dumps({"ok": True, "action": "stop"})
+
+
+def _require_follow(follow):
+    if follow is None:
+        raise RuntimeError(
+            "follow adapter not connected — start run_tracker.py on the robot"
+        )
+
+
+def _list_people(robot, motion, follow, vlm, args: dict) -> str:
+    _require_follow(follow)
+    dets = follow.get_detections()
+    if not dets:
+        return json.dumps({"people": [], "note": "no people currently detected"})
+
+    # Use the regular RGB camera frame (same physical camera YOLO sees) plus
+    # the YOLO bbox list. The VLM gets the raw image and the bboxes as text;
+    # it correlates them spatially.
+    jpeg = robot.rgb_jpeg_b64()
+    bbox_list = ", ".join(
+        f"id {d.id} at bbox {[int(v) for v in d.bbox]}" for d in dets
+    )
+    prompt = (
+        f"This image is from a guide-dog robot at knee height. A YOLO "
+        f"tracker has detected {len(dets)} people in this frame. Their "
+        f"bounding boxes (x1, y1, x2, y2 in image pixels) and tracker "
+        f"ids are: {bbox_list}. The image is {robot.get_rgb().width} "
+        f"pixels wide. For each id, give a one-sentence description of "
+        f"that specific person — clothes, colors, position (left / "
+        f"center / right). Return strict JSON: {{\"people\": [{{\"id\": "
+        f"<int>, \"description\": \"...\"}}]}}. Use only the listed ids."
+    )
+    raw = vlm_describe(vlm, jpeg, prompt, max_tokens=600)
+    return json.dumps(
+        {
+            "yolo_ids": [d.id for d in dets],
+            "vlm_descriptions_raw": raw,
+            "note": (
+                "Match the user's description to one of the yolo_ids above, "
+                "then call follow_person with that id."
+            ),
+        }
+    )
+
+
+def _follow_person(robot, motion, follow, vlm, args: dict) -> str:
+    _require_follow(follow)
+    follow.follow(int(args["yolo_id"]))
+    return json.dumps({"ok": True, "action": "follow_person", "yolo_id": args["yolo_id"]})
+
+
+def _stop_following(robot, motion, follow, vlm, args: dict) -> str:
+    _require_follow(follow)
+    follow.stop()
+    return json.dumps({"ok": True, "action": "stop_following"})
 
 
 _HANDLERS = {
@@ -242,16 +328,19 @@ _HANDLERS = {
     "walk_forward": _walk_forward,
     "walk_backward": _walk_backward,
     "turn_left": _turn_left,
+    "list_people": _list_people,
+    "follow_person": _follow_person,
+    "stop_following": _stop_following,
     "turn_right": _turn_right,
     "stop_motion": _stop_motion,
 }
 
 
-def dispatch(name: str, args: dict, robot: Lite3Robot, motion, vlm) -> str:
+def dispatch(name: str, args: dict, robot, motion, follow, vlm) -> str:
     handler = _HANDLERS.get(name)
     if handler is None:
         return json.dumps({"error": f"unknown tool: {name}"})
     try:
-        return handler(robot, motion, vlm, args)
+        return handler(robot, motion, follow, vlm, args)
     except Exception as e:
         return json.dumps({"error": f"{type(e).__name__}: {e}"})

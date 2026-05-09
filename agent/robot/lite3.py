@@ -227,7 +227,10 @@ class Lite3Robot:
             self._cmd_vel.unadvertise()
         except Exception:
             pass
-        self._client.terminate()
+        try:
+            self._client.terminate()
+        except Exception:
+            pass  # roslibpy 2.0 cleanup bug; harmless
 
     def __enter__(self) -> "Lite3Robot":
         return self

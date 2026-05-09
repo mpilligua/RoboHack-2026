@@ -136,6 +136,47 @@ Then:
 | Dog doesn't move on `/cmd_vel` | Auto Mode not on, or not in walk mode | use the DeepRobotics app to enable Auto Mode + stand |
 | Tracker hangs at `BLOCKING MODE` | Just warming up | wait 40s for TensorRT |
 
+## RGB camera silently goes to 0 Hz (depth still works)
+
+Symptom — the realsense systemd service shows `active (running)`, depth is publishing
+fine at 30 Hz, but `/camera/color/image_raw` has zero messages and `get_status` returns
+`rgb_age_s: null`. `journalctl -u realsense` shows lines like:
+
+```
+messenger-libusb.cpp: control_transfer returned error, Resource temporarily unavailable
+```
+
+What's happening — the Intel D435i has two parallel USB pipes: one for depth (lower
+bandwidth), one for color (higher bandwidth). Under sustained load — or sometimes just
+randomly — the color pipe's USB control transfer fails and the camera firmware leaves
+that channel in a stuck state. Restarting the realsense ROS node alone doesn't fix it,
+because the bug isn't in the ROS node. It's in the **kernel UVC driver** holding stale
+state, plus the camera firmware refusing further control transfers on the bad pipe.
+
+The fix that works — kick the UVC kernel driver out and reload it, *then* restart the
+realsense node:
+
+```
+sudo /sbin/modprobe -r uvcvideo && sudo /sbin/modprobe uvcvideo
+sudo systemctl restart realsense
+sleep 10
+timeout 5 rostopic hz /camera/color/image_raw   # should now show ~30 Hz
+```
+
+Why each step matters:
+- `modprobe -r uvcvideo` unloads the kernel module that owns the USB camera. This forces
+  the kernel to drop its stuck state.
+- `modprobe uvcvideo` reloads it cleanly, which re-enumerates the camera and re-negotiates
+  the USB pipes from scratch.
+- `systemctl restart realsense` then re-launches the ROS node so it can attach to the
+  freshly-clean device.
+- `sleep 10` gives the realsense node time to enumerate, configure streams, and start
+  publishing before we test.
+
+If after this the rate is still 0, the camera USB is stuck deeper than the kernel driver
+can fix. Power-cycle the dog. If even that fails, physically reseat the camera's USB
+cable on the robot.
+
 ## Rotating the Bedrock token
 
 Bearer tokens expire in ~12h. When you see `Authentication failed: Please make sure your API Key is valid.`, get a fresh one and update [agent/.env](.env). Don't paste the token in chat / commits.
