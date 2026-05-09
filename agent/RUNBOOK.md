@@ -184,6 +184,7 @@ realsense node:
 ```
 sudo /sbin/modprobe -r uvcvideo && sudo /sbin/modprobe uvcvideo
 sudo systemctl restart realsense
+source /opt/ros/noetic/setup.bash
 sleep 10
 timeout 5 rostopic hz /camera/color/image_raw   # should now show ~30 Hz
 ```
