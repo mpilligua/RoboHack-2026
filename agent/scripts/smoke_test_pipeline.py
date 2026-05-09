@@ -24,7 +24,7 @@ from memory.store import MemoryStore
 from safety.supervisor import SafetySupervisor
 from tools.base import ToolContext
 from tools.setup import build_registry
-from agents_app.sdk_agents import DialogueAgent, PlannerAgent, _make_agent_client
+from agents_app.sdk_agents import PlannerAgent, _make_agent_client
 from agents_app.orchestrator import Orchestrator
 
 
@@ -64,9 +64,8 @@ def _build_orchestrator(robot, motion, follow, basic_goal):
     )
     registry = build_registry()
     oa_client = _make_agent_client()
-    dialogue = DialogueAgent(oa_client)
     planner = PlannerAgent(oa_client, registry, ctx)
-    return Orchestrator(dialogue, planner, memory)
+    return Orchestrator(planner, memory)
 
 
 def run_tests(orchestrator):
