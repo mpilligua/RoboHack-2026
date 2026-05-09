@@ -20,17 +20,22 @@ _SPECS = [
     ),
     (
         "describe_scene",
-        "Capture the current camera frame and return a description of what the robot sees.",
+        "Open-vocabulary scene narration via VLM. Use when the user asks about the situation, "
+        "atmosphere, layout, or hazards that COCO/YOLO can't name (cables, puddles, signs, "
+        "open boxes). Do NOT also call list_visible_objects in the same turn.",
         {"focus": {"type": "string", "description": "Optional hint, e.g. 'obstacles ahead', 'people'."}},
         [],
     ),
     (
         "read_label",
-        "Capture the current frame and read all visible text on a specific item.",
+        "Capture the current frame and read all visible text on a specific item. Self-contained: "
+        "do NOT call describe_scene or list_visible_objects first.",
         {"item_description": {"type": "string", "description": "Which item to read, e.g. 'the red can'."}},
         ["item_description"],
     ),
-    ("get_rgbd_summary", "Return depth statistics (min, center, median, valid_fraction).", {}, []),
+    ("get_rgbd_summary", "Return depth statistics (min, center, median, valid_fraction). "
+        "walk_forward and go_to_object run their own depth check internally — do NOT call this "
+        "as a manual safety pre-flight before motion.", {}, []),
     (
         "get_depth_at_pixel",
         "Get approximate depth at a specific RGB pixel (u, v).",
@@ -43,16 +48,13 @@ _SPECS = [
     ),
     (
         "list_visible_objects",
-        "List all YOLO-detected objects with VLM descriptions. Updates object memory. "
-        "Always call before follow_person or go_to_object.",
-        {}, [],
-    ),
-    ("get_visible_objects", "Return all objects currently in memory.", {}, []),
-    (
-        "find_object",
-        "Find objects in memory by label (case-insensitive partial match).",
-        {"label": {"type": "string", "description": "Label to search for, e.g. 'chair', 'person'."}},
-        ["label"],
+        "YOLO-detected objects (COCO classes only) with per-detection VLM descriptions and "
+        "yolo_ids you can pass to follow_person / go_to_object. Use when the user wants to "
+        "act on a specific object, or asks 'is there a <COCO thing> nearby'. Do NOT also call "
+        "describe_scene in the same turn.",
+        {"label_filter": {"type": "string", "description": "Optional case-insensitive substring "
+            "to filter by label, e.g. 'chair'. Omit to list everything."}},
+        [],
     ),
     (
         "resolve_reference",
@@ -61,19 +63,10 @@ _SPECS = [
         ["ref"],
     ),
     (
-        "find_objects_matching_constraints",
-        "Filter objects in memory by label, position, and/or depth range.",
-        {
-            "label": {"type": "string"},
-            "position": {"type": "string", "enum": ["left", "center", "right"]},
-            "max_depth_m": {"type": "number"},
-            "min_depth_m": {"type": "number"},
-        },
-        [],
-    ),
-    (
         "walk_forward",
-        "Walk forward. Specify distance_m (preferred) or duration_s.",
+        "Walk forward. Specify distance_m (preferred) or duration_s. Runs its own depth-based "
+        "safety check internally — do NOT call get_rgbd_summary or describe_scene first. "
+        "Returns ok=false with a depth_check field if the path is blocked.",
         {
             "distance_m": {"type": "number", "description": "Distance to walk in meters."},
             "duration_s": {"type": "number", "description": "Alternatively, walk for this many seconds."},
@@ -167,7 +160,10 @@ _SPECS = [
     ),
     (
         "go_to_object",
-        "Approach a YOLO-tracked object and auto-stop when close. Call list_visible_objects first.",
+        "Approach a YOLO-tracked object and auto-stop when close. Call list_visible_objects "
+        "first to get a yolo_id. Returns IMMEDIATELY after dispatching the goal; the robot "
+        "stops itself when median depth in the target bbox <= stop_distance_m. Do NOT poll "
+        "get_basic_goal_status afterwards — assume success unless an error follows.",
         {
             "yolo_id": {"type": "integer"},
             "stop_distance_m": {"type": "number", "description": "Stop when depth <= this (default 0.8 m)."},

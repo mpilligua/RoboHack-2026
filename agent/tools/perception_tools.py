@@ -76,9 +76,16 @@ def handle_list_visible_objects(ctx: ToolContext, args: dict) -> ToolResult:
     if ctx.follow is None:
         return ToolResult(ok=False, tool="list_visible_objects", error="follow adapter not connected")
 
+    label_filter = (args.get("label_filter") or "").strip().lower()
     dets = ctx.follow.get_detections()
+    if label_filter:
+        dets = [d for d in dets if label_filter in (d.label or "").lower()]
     if not dets:
-        return ToolResult(ok=True, tool="list_visible_objects", result={"objects": [], "note": "no detections"})
+        note = (
+            f"no detections matching label_filter={label_filter!r}"
+            if label_filter else "no detections"
+        )
+        return ToolResult(ok=True, tool="list_visible_objects", result={"objects": [], "note": note})
 
     # Return cached descriptions if all current detections are fresh in memory.
     now = time.time()
