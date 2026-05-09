@@ -42,7 +42,7 @@ roslaunch rosbridge_server rosbridge_websocket.launch
 
 **Wait for** `Rosbridge WebSocket server started at ws://0.0.0.0:9090`. Leave open.
 
-## 4. Robot terminal C — foxy rosbridge (motion + follow)
+## 4. Robot terminal C — foxy rosbridge (motion + follow + basic goal)
 
 **Open a fresh SSH session — don't reuse a terminal you sourced noetic in.**
 
@@ -63,7 +63,7 @@ nc -vz 192.168.1.103 9091
 
 Both should say "succeeded".
 
-## 6. Laptop — run the agent (perception + motion only)
+## 6. Laptop — run the agent (perception + motion)
 
 ```
 cd /Users/maria/Desktop/RoboHack/agent
@@ -71,15 +71,38 @@ source .venv/bin/activate
 python cli.py
 ```
 
-You'll see four "connecting" lines. The fourth one (follow tracker) will succeed at TCP level even though the tracker isn't running — `list_people` will return "no people detected" until step 8.
+You should see stderr lines for: camera bridge (9090), **one** ROS 2 bridge (9091) shared by motion, follow, and basic goal, then adapter status. If the tracker isn’t running yet, follow still connects — detection tools return empty until step 8.
 
 Smoke-test:
 ```
 > what do you see?
-> walk forward briefly
+> send a basic goal to x 0.2 y 0.0 theta 0.0
+> cancel the basic goal
 ```
 
-If the camera works and the dog walks, perception + motion are good.
+If the camera works and the dog moves to the short goal, perception + motion are good.
+
+## 6b. Basic goal + low-level command checks (real robot)
+
+Make sure the area is clear and Auto Mode is on.
+
+Basic goal:
+```
+> send a basic goal to x 0.3 y 0.0 theta 0.0
+> what is the basic goal status?
+> cancel the basic goal
+```
+
+Optional wait-for status:
+```
+> wait for basic goal status goal_reached (timeout 10s)
+```
+
+Low-level commands (use valid command codes for your controller):
+```
+> send a simple cmd with cmd_code 1 size 0 type 0
+> send a complex cmd with cmd_code 2 size 1 type 0 data 0.5
+```
 
 ## 7. (Optional) Robot terminal D — start the follow tracker
 
@@ -126,6 +149,8 @@ Then:
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
+| Agent launch breaks other robot clients | rosbridge overloaded (burst subscriptions from multiple tools / agents) | Run only one `python cli.py`; remove stale `.cli.pid.lock` if needed; lower `RGB_MAX_HZ` / `DEPTH_MAX_HZ` in `.env` (defaults 2 Hz) |
+| `Another agent appears to be running` | Second CLI or crashed exit left lock | Stop the other process or delete `agent/.cli.pid.lock` if stale (Windows: delete manually; Unix: lock clears if PID is dead) |
 | Camera dies (`No RealSense devices were found`) | RealSense USB flake. Sometimes correlated with tracker running. | `sudo systemctl restart realsense`; if persistent, reseat USB cable |
 | `Failed to connect to ROS` | rosbridge died (terminal closed) | redo step 3 or 4 |
 | `Can't assign requested address` | route gone | redo step 1 |

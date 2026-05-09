@@ -64,9 +64,11 @@ class Pose:
 class Lite3Robot:
     """rosbridge wrapper that fetches frames on demand only.
 
-    To keep WiFi bandwidth low (camera frames are ~35 MB/s raw at 30 Hz),
-    we subscribe → wait for one message → unsubscribe per call. Idle cost
-    is zero; per-call latency is +100–300 ms.
+    Camera streams are large at full rate (~35 MB/s raw at 30 Hz over WiFi).
+    By default each ``get_rgb`` / ``get_depth`` does subscribe → one message →
+    unsubscribe. Optional ``max_rgb_hz`` / ``max_depth_hz`` add client-side
+    throttling: reuse recent cached frames or sleep between fetches. Pose
+    fetches are not throttled.
     """
 
     def __init__(
@@ -74,9 +76,17 @@ class Lite3Robot:
         host: str = "192.168.1.103",
         port: int = 9090,
         connect_timeout_s: float = 10.0,
+        *,
+        max_rgb_hz: Optional[float] = None,
+        max_depth_hz: Optional[float] = None,
     ) -> None:
         self._client = roslibpy.Ros(host=host, port=port)
         self._lock = threading.Lock()
+        # Max fetch rates for RGB/depth (pose is uncapped). None or <=0 = unlimited.
+        self._max_rgb_hz = max_rgb_hz
+        self._max_depth_hz = max_depth_hz
+        self._last_rgb_fetch_mono: float = 0.0
+        self._last_depth_fetch_mono: float = 0.0
         # Last fetched frames are cached for status reporting only — we don't
         # auto-update them, so `get_status` can show "rgb_age_s = 5s ago" etc.
         self._rgb: Optional[RGBFrame] = None
@@ -94,6 +104,37 @@ class Lite3Robot:
             self._client, CMD_VEL_TOPIC, "geometry_msgs/Twist"
         )
         self._cmd_vel.advertise()
+
+    def _respect_rgb_rate_limit(self) -> Optional[RGBFrame]:
+        """Return cached RGB if we must not fetch yet; otherwise sleep until ok."""
+        if self._max_rgb_hz is None or self._max_rgb_hz <= 0:
+            return None
+        interval = 1.0 / float(self._max_rgb_hz)
+        with self._lock:
+            cached = self._rgb
+            last = self._last_rgb_fetch_mono
+        now = time.monotonic()
+        if cached is not None and (now - last) < interval:
+            return cached
+        wait = interval - (now - last)
+        if wait > 0:
+            time.sleep(wait)
+        return None
+
+    def _respect_depth_rate_limit(self) -> Optional[DepthFrame]:
+        if self._max_depth_hz is None or self._max_depth_hz <= 0:
+            return None
+        interval = 1.0 / float(self._max_depth_hz)
+        with self._lock:
+            cached = self._depth
+            last = self._last_depth_fetch_mono
+        now = time.monotonic()
+        if cached is not None and (now - last) < interval:
+            return cached
+        wait = interval - (now - last)
+        if wait > 0:
+            time.sleep(wait)
+        return None
 
     def _fetch_one(self, topic_name: str, msg_type: str, timeout_s: float):
         """Subscribe, wait for one message, unsubscribe. Returns the dict or
@@ -123,6 +164,9 @@ class Lite3Robot:
     # ------------------------------------------------------------- public API
 
     def get_rgb(self, timeout_s: float = 5.0) -> RGBFrame:
+        cached = self._respect_rgb_rate_limit()
+        if cached is not None:
+            return cached
         msg = self._fetch_one(RGB_TOPIC, "sensor_msgs/Image", timeout_s)
         data = base64.b64decode(msg["data"])
         h, w = msg["height"], msg["width"]
@@ -134,9 +178,13 @@ class Lite3Robot:
         frame = RGBFrame(image=img, width=w, height=h, stamp=time.time())
         with self._lock:
             self._rgb = frame
+            self._last_rgb_fetch_mono = time.monotonic()
         return frame
 
     def get_depth(self, timeout_s: float = 5.0) -> DepthFrame:
+        cached = self._respect_depth_rate_limit()
+        if cached is not None:
+            return cached
         msg = self._fetch_one(DEPTH_TOPIC, "sensor_msgs/Image", timeout_s)
         data = base64.b64decode(msg["data"])
         h, w = msg["height"], msg["width"]
@@ -144,6 +192,7 @@ class Lite3Robot:
         frame = DepthFrame(depth_mm=depth, width=w, height=h, stamp=time.time())
         with self._lock:
             self._depth = frame
+            self._last_depth_fetch_mono = time.monotonic()
         return frame
 
     def get_rgbd(self, timeout_s: float = 5.0) -> tuple[RGBFrame, DepthFrame]:

@@ -7,3 +7,4 @@ Pillow>=10.0.0
 # Voice UI (phone push-to-talk → laptop server)
 flask>=3.0
 openai-whisper>=20231117
+openai>=1.30.0
