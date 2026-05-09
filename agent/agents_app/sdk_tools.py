@@ -73,39 +73,43 @@ _SPECS = [
     ),
     (
         "walk_forward",
-        "Walk forward a given distance in meters.",
+        "Walk forward. Specify distance_m (preferred) or duration_s.",
         {
-            "distance_m": {"type": "number", "description": "Distance to walk forward (meters)."},
+            "distance_m": {"type": "number", "description": "Distance to walk in meters."},
+            "duration_s": {"type": "number", "description": "Alternatively, walk for this many seconds."},
             "speed": {"type": "number", "description": "Speed in m/s (default 0.15, max 0.3)."},
         },
-        ["distance_m"],
+        [],
     ),
     (
         "walk_backward",
-        "Walk backward a given distance in meters.",
+        "Walk backward. Specify distance_m (preferred) or duration_s.",
         {
-            "distance_m": {"type": "number", "description": "Distance to walk backward (meters)."},
+            "distance_m": {"type": "number", "description": "Distance to walk in meters."},
+            "duration_s": {"type": "number", "description": "Alternatively, walk for this many seconds."},
             "speed": {"type": "number", "description": "Speed in m/s (default 0.15)."},
         },
-        ["distance_m"],
+        [],
     ),
     (
         "turn_left",
-        "Rotate left (counter-clockwise) by a given angle.",
+        "Rotate left (counter-clockwise). Specify angle_deg (preferred) or duration_s.",
         {
             "angle_deg": {"type": "number", "description": "Angle to rotate in degrees."},
+            "duration_s": {"type": "number", "description": "Alternatively, rotate for this many seconds."},
             "omega": {"type": "number", "description": "Angular speed in rad/s (default 0.4)."},
         },
-        ["angle_deg"],
+        [],
     ),
     (
         "turn_right",
-        "Rotate right (clockwise) by a given angle.",
+        "Rotate right (clockwise). Specify angle_deg (preferred) or duration_s.",
         {
             "angle_deg": {"type": "number", "description": "Angle to rotate in degrees."},
+            "duration_s": {"type": "number", "description": "Alternatively, rotate for this many seconds."},
             "omega": {"type": "number", "description": "Angular speed in rad/s (default 0.4)."},
         },
-        ["angle_deg"],
+        [],
     ),
     ("stop_motion", "Stop all robot motion without stopping the tracker.", {}, []),
     (
