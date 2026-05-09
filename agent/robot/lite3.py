@@ -21,6 +21,8 @@ import numpy as np
 import roslibpy
 from PIL import Image
 
+from .rgbd_naive import compute_depth_at_rgb_pixel_naive
+
 
 RGB_TOPIC = "/camera/color/image_raw"
 # Note: this Lite3 publishes depth in the camera's own frame, not aligned to
@@ -194,6 +196,30 @@ class Lite3Robot:
             "center_mm": center_mm,
             "valid_fraction": float(valid.size / d.size),
         }
+
+    def depth_at_rgb_pixel_naive(
+        self,
+        u_rgb: int,
+        v_rgb: int,
+        *,
+        window_radius: int = 3,
+        timeout_s: float = 3.0,
+    ) -> dict:
+        """Approximate depth at an RGB pixel.
+
+        Captures the latest RGB and depth frames, scales the RGB pixel into
+        depth image coordinates, and falls back to the nearest valid depth in
+        a local window when the direct depth sample is invalid.
+        """
+        rgb_frame, depth_frame = self.get_rgbd(timeout_s)
+        return compute_depth_at_rgb_pixel_naive(
+            rgb_width=rgb_frame.width,
+            rgb_height=rgb_frame.height,
+            depth_mm=depth_frame.depth_mm,
+            u_rgb=int(u_rgb),
+            v_rgb=int(v_rgb),
+            window_radius=int(window_radius),
+        )
 
     # ---------------------------------------------------------------- motion
     # Locomotion is Person A's territory; these are stubs that publish to

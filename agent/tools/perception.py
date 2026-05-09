@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from robot import Lite3Follow, Lite3Motion, Lite3Robot
 from vlm import vlm_describe
 
 
@@ -71,6 +70,30 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "how far an object is."
         ),
         {},
+    ),
+    _spec(
+        "get_depth_at_pixel",
+        (
+            "Get approximate depth at a requested RGB pixel (u, v). Captures "
+            "the latest RGB and depth frames, maps RGB to depth by resolution "
+            "scaling, then extrapolates using the nearest valid depth in a "
+            "small window when direct depth is invalid."
+        ),
+        {
+            "u": {
+                "type": "integer",
+                "description": "Horizontal pixel in RGB image (0 is left).",
+            },
+            "v": {
+                "type": "integer",
+                "description": "Vertical pixel in RGB image (0 is top).",
+            },
+            "window_radius": {
+                "type": "integer",
+                "description": "Search radius in depth pixels for fallback; default 3.",
+            },
+        },
+        required=["u", "v"],
     ),
     _spec(
         "get_pose",
@@ -200,6 +223,15 @@ def _get_rgbd_summary(robot, motion, follow, vlm, args: dict) -> str:
     return json.dumps(robot.depth_summary())
 
 
+def _get_depth_at_pixel(robot, motion, follow, vlm, args: dict) -> str:
+    out = robot.depth_at_rgb_pixel_naive(
+        int(args["u"]),
+        int(args["v"]),
+        window_radius=int(args.get("window_radius", 3)),
+    )
+    return json.dumps(out)
+
+
 def _get_pose(robot, motion, follow, vlm, args: dict) -> str:
     pose = robot.get_pose()
     if pose is None:
@@ -323,6 +355,7 @@ _HANDLERS = {
     "describe_scene": _describe_scene,
     "read_label": _read_label,
     "get_rgbd_summary": _get_rgbd_summary,
+    "get_depth_at_pixel": _get_depth_at_pixel,
     "get_pose": _get_pose,
     "get_status": _get_status,
     "walk_forward": _walk_forward,

@@ -75,6 +75,7 @@ Tool calls and results are echoed to stderr so you can see the agent reasoning.
 | `describe_scene`    | Captures one RGB frame, sends to Qwen-VL with a focus hint            |
 | `read_label`        | Captures one RGB frame, asks Qwen-VL to read text on a named item     |
 | `get_rgbd_summary`  | Local depth stats: closest, center distance, valid fraction           |
+| `get_depth_at_pixel`| Approx depth for RGB pixel `(u,v)` + nearest-valid fallback window    |
 | `get_pose`          | x, y, yaw from `/leg_odom`                                            |
 | `get_status`        | Connection + frame ages — diagnostics                                 |
 
