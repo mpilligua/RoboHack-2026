@@ -32,16 +32,33 @@ class Detection:
 
 
 class Lite3Follow:
-    def __init__(self, host: str = "192.168.1.103", port: int = 9091, connect_timeout_s: float = 10.0):
-        self._client = roslibpy.Ros(host=host, port=port)
+    def __init__(
+        self,
+        host: str = "192.168.1.103",
+        port: int = 9091,
+        connect_timeout_s: float = 10.0,
+        *,
+        ros_client: Optional[roslibpy.Ros] = None,
+    ):
+        """Subscribe/publish tracker topics via ROS 2 rosbridge.
+
+        If ``ros_client`` is set, it must already be connected; this adapter does
+        not terminate it on ``close()`` (caller owns the socket).
+        """
         self._lock = threading.Lock()
         self._dets: list[Detection] = []
 
-        self._client.run(timeout=connect_timeout_s)
-        if not self._client.is_connected:
-            raise RuntimeError(
-                f"Could not connect to foxy rosbridge at ws://{host}:{port}"
-            )
+        if ros_client is not None:
+            self._client = ros_client
+            self._owns_client = False
+        else:
+            self._client = roslibpy.Ros(host=host, port=port)
+            self._client.run(timeout=connect_timeout_s)
+            if not self._client.is_connected:
+                raise RuntimeError(
+                    f"Could not connect to foxy rosbridge at ws://{host}:{port}"
+                )
+            self._owns_client = True
 
         self._det_sub = roslibpy.Topic(self._client, DET_TOPIC, "std_msgs/String")
         self._det_sub.subscribe(self._on_dets)
@@ -97,10 +114,11 @@ class Lite3Follow:
             self._target_pub.unadvertise()
         except Exception:
             pass
-        try:
-            self._client.terminate()
-        except Exception:
-            pass  # roslibpy 2.0 cleanup bug; harmless
+        if self._owns_client:
+            try:
+                self._client.terminate()
+            except Exception:
+                pass  # roslibpy 2.0 cleanup bug; harmless
 
     def __enter__(self) -> "Lite3Follow":
         return self

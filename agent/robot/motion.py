@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import threading
 import time
+from typing import Optional
 
 import roslibpy
 
@@ -30,14 +31,31 @@ def _clip(v: float, hi: float) -> float:
 
 
 class Lite3Motion:
-    def __init__(self, host: str = "192.168.1.103", port: int = 9091, connect_timeout_s: float = 10.0):
-        self._client = roslibpy.Ros(host=host, port=port)
-        self._client.run(timeout=connect_timeout_s)
-        if not self._client.is_connected:
-            raise RuntimeError(
-                f"Could not connect to foxy rosbridge at ws://{host}:{port}. "
-                "Is `ros2 launch rosbridge_server rosbridge_websocket_launch.xml port:=9091` running?"
-            )
+    def __init__(
+        self,
+        host: str = "192.168.1.103",
+        port: int = 9091,
+        connect_timeout_s: float = 10.0,
+        *,
+        ros_client: Optional[roslibpy.Ros] = None,
+    ):
+        """Publish ``/cmd_vel`` via ROS 2 rosbridge.
+
+        If ``ros_client`` is set, it must already be connected; this adapter does
+        not terminate it on ``close()`` (caller owns the socket).
+        """
+        if ros_client is not None:
+            self._client = ros_client
+            self._owns_client = False
+        else:
+            self._client = roslibpy.Ros(host=host, port=port)
+            self._client.run(timeout=connect_timeout_s)
+            if not self._client.is_connected:
+                raise RuntimeError(
+                    f"Could not connect to foxy rosbridge at ws://{host}:{port}. "
+                    "Is `ros2 launch rosbridge_server rosbridge_websocket_launch.xml port:=9091` running?"
+                )
+            self._owns_client = True
         self._cmd_vel = roslibpy.Topic(self._client, CMD_VEL_TOPIC, "geometry_msgs/Twist")
         self._cmd_vel.advertise()
         self._stop_flag = threading.Event()
@@ -100,10 +118,11 @@ class Lite3Motion:
             self._cmd_vel.unadvertise()
         except Exception:
             pass
-        try:
-            self._client.terminate()
-        except Exception:
-            pass  # roslibpy 2.0 cleanup bug; harmless
+        if self._owns_client:
+            try:
+                self._client.terminate()
+            except Exception:
+                pass  # roslibpy 2.0 cleanup bug; harmless
 
     def __enter__(self) -> "Lite3Motion":
         return self

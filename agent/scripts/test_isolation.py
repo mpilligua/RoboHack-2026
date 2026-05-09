@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from robot import Lite3Follow, Lite3Motion, Lite3Robot  # noqa: E402
+from robot import Lite3Follow, Lite3Motion, Lite3Robot, connect_ros2_rosbridge  # noqa: E402
 
 
 def setup():
@@ -79,10 +79,11 @@ def t_follow():
 
 def t_all():
     host, p1, p2 = setup()
-    print(f"[all] connect everything", file=sys.stderr)
+    print("[all] connect everything (one ROS2 socket)", file=sys.stderr)
     robot = Lite3Robot(host=host, port=p1)
-    motion = Lite3Motion(host=host, port=p2)
-    follow = Lite3Follow(host=host, port=p2)
+    ros2 = connect_ros2_rosbridge(host, p2)
+    motion = Lite3Motion(ros_client=ros2)
+    follow = Lite3Follow(ros_client=ros2)
     try:
         rgb = robot.get_rgb(timeout_s=5.0)
         depth = robot.get_depth(timeout_s=5.0)
@@ -93,6 +94,10 @@ def t_all():
     finally:
         follow.close()
         motion.close()
+        try:
+            ros2.terminate()
+        except Exception:
+            pass
         robot.close()
 
 
