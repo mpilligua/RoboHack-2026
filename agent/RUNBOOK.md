@@ -145,6 +145,62 @@ Then:
 > stop following
 ```
 
+## 9. (Optional) Voice + phone web app
+
+A push-to-talk web app on your phone records audio, the laptop runs Whisper STT,
+feeds the transcript into the same agent (Orchestrator → DialogueAgent →
+PlannerAgent → tools), TTSes the reply with macOS `say`, sends it back. Same
+agent the typed CLI uses (no separate code path).
+
+**Pre-flight on the laptop:**
+- Whisper is installed in the venv (`pip show openai-whisper` should print)
+- `ffmpeg` is on PATH (`brew install ffmpeg`) — Whisper uses it to decode
+  the phone's audio
+- Phone is on the **same WiFi as the laptop**
+
+Start the server (laptop):
+
+```
+cd /Users/maria/Desktop/RoboHack/agent
+source .venv/bin/activate
+python voice_server.py
+```
+
+Wait for these lines in stderr:
+- `[voice] preloading whisper model=base …` then `whisper ready in N.Ns`
+- `[voice] connecting to camera bridge ws://192.168.1.103:9090 …`
+- `[voice] new pipeline ready [bedrock-boto3]` ← confirms the new agent path
+  (if you see `falling back to legacy run_once`, paste the error)
+- `[voice] serving on http://0.0.0.0:5050/`
+
+Find the laptop's WiFi IP:
+
+```
+ipconfig getifaddr en0
+```
+
+On the phone, open in Safari/Chrome:
+
+```
+http://<laptop-wifi-ip>:5050/
+```
+
+First time only: tap **enable audio** (iOS Safari needs a user gesture before
+playback). Then **hold the big button to talk** → release → wait ~3–6 s
+(Whisper + Bedrock + TTS) → the reply plays automatically.
+
+Sanity-check audio without the agent: open `http://<laptop-ip>:5050/tts_test`
+on the phone — should download/play "hello, this is a test of the audio path."
+
+Tweaks (env vars):
+- `WHISPER_MODEL=tiny|base|small|medium` — default `base`. `tiny` is faster but
+  less accurate; `small` is the sweet spot if the laptop has the headroom.
+- `TTS_VOICE=Samantha|Daniel|Karen|Allison|...` — any macOS `say` voice
+  (`say -v ?` to list)
+- `VOICE_PORT=5050` — change if 5050 is taken
+- `LEGACY_LOOP=1` — bypass the Orchestrator and use the old single-agent loop
+  (useful if the new pipeline is broken)
+
 ## Known issues
 
 | Symptom | Likely cause | Fix |
@@ -160,6 +216,53 @@ Then:
 | `_TYPE_SUPPORT` error launching tracker | mixed noetic + foxy in shell | open fresh SSH, source only foxy |
 | Dog doesn't move on `/cmd_vel` | Auto Mode not on, or not in walk mode | use the DeepRobotics app to enable Auto Mode + stand |
 | Tracker hangs at `BLOCKING MODE` | Just warming up | wait 40s for TensorRT |
+| `RLException: run_id on parameter server does not match declared run_id` | A previous `roslaunch` is still alive owning the noetic rosmaster, and a new launch tried to spin up a competing one | See "Killing stale rosbridge / roslaunch" below |
+
+## Killing stale rosbridge / roslaunch
+
+If a previous SSH terminal disconnected without `Ctrl+C`-ing the rosbridge, the
+process is still running on the robot, holding port 9090 (or 9091) and the
+rosmaster `run_id`. A fresh `roslaunch rosbridge_server …` then crashes with
+`RLException: run_id on parameter server does not match declared run_id`.
+
+Find and kill it. On the robot:
+
+```
+ps -fC python3 | grep -E "roslaunch|rosbridge|rosapi" | grep -v grep
+ps -fC python3 | grep ros2 | grep -v grep
+```
+
+Note the PIDs in column 2. Then:
+
+```
+# noetic side (port 9090) — kill rosbridge AND any stale roslaunch parent
+pkill -f rosbridge_websocket
+pkill -f "roslaunch rosbridge_server"
+
+# foxy side (port 9091)
+pkill -f "ros2 launch rosbridge_server"
+```
+
+DO NOT kill the realsense roslaunch — it's the one that owns the noetic
+rosmaster you actually want to keep:
+
+```
+ps -ef | grep "roslaunch realsense2_camera" | grep -v grep   # leave this alone
+```
+
+After the kills, retry the launch from the runbook step. The rosmaster from the
+realsense service stays up, your new rosbridge attaches to it cleanly with:
+
+```
+ROS_MASTER_URI=http://localhost:11311 roslaunch rosbridge_server rosbridge_websocket.launch
+```
+
+Confirm it's listening:
+
+```
+nc -vz localhost 9090   # for noetic
+nc -vz localhost 9091   # for foxy
+```
 
 ## RGB camera silently goes to 0 Hz (depth still works)
 
