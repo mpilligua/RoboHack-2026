@@ -37,7 +37,7 @@ if _USE_NEW_PIPELINE:
     from safety.supervisor import SafetySupervisor
     from tools.base import ToolContext
     from tools.setup import build_registry
-    from agents_app.sdk_agents import DialogueAgent, PlannerAgent, _make_agent_client, _use_openai_compat
+    from agents_app.sdk_agents import PlannerAgent, _make_agent_client, _use_openai_compat
     from agents_app.orchestrator import Orchestrator
 
 
@@ -261,9 +261,8 @@ def main() -> None:
             )
             registry = build_registry()
             oa_client = _make_agent_client() if _use_openai_compat() else None
-            dialogue = DialogueAgent(oa_client)
             planner = PlannerAgent(registry, ctx, client=oa_client)
-            orchestrator = Orchestrator(dialogue, planner, memory)
+            orchestrator = Orchestrator(planner, memory)
             backend = "openai-compat" if oa_client else "bedrock-boto3"
             print(f"new pipeline ready [{backend}] (LEGACY_LOOP=1 to use legacy loop)", file=sys.stderr)
         except Exception as e:

@@ -69,6 +69,9 @@ def handle_get_depth_at_pixel(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult(ok=True, tool="get_depth_at_pixel", result=result)
 
 
+_DESCRIPTION_TTL_S = 8.0
+
+
 def handle_list_visible_objects(ctx: ToolContext, args: dict) -> ToolResult:
     if ctx.follow is None:
         return ToolResult(ok=False, tool="list_visible_objects", error="follow adapter not connected")
@@ -76,6 +79,19 @@ def handle_list_visible_objects(ctx: ToolContext, args: dict) -> ToolResult:
     dets = ctx.follow.get_detections()
     if not dets:
         return ToolResult(ok=True, tool="list_visible_objects", result={"objects": [], "note": "no detections"})
+
+    # Return cached descriptions if all current detections are fresh in memory.
+    now = time.time()
+    cached = []
+    for d in dets:
+        rec = ctx.memory.get_object(d.id)
+        if rec is None or not rec.description or (now - rec.last_seen_ts) > _DESCRIPTION_TTL_S:
+            break
+        cached.append({"id": rec.yolo_id, "label": rec.label, "description": rec.description})
+    else:
+        for d in dets:
+            ctx.memory.get_object(d.id).last_seen_ts = now
+        return ToolResult(ok=True, tool="list_visible_objects", result={"objects": cached, "cached": True})
 
     try:
         jpeg = ctx.robot.rgb_jpeg_b64()
