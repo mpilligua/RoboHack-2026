@@ -25,3 +25,6 @@ ENV/
 *.swp
 *.swo
 src/*
+
+# Agent CLI single-instance lock (safe to delete if stale)
+agent/.cli.pid.lock
