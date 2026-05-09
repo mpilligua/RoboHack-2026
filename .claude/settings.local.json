@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\pamar\\\\Desktop\\\\robohack-2026\\\\agent\\\\\" -Recurse -Force | Select-Object FullName | ConvertTo-Csv -NoTypeInformation | Out-String)"
+    ]
+  }
+}

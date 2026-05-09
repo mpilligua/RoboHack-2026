@@ -3,3 +3,4 @@ roslibpy>=1.7.0
 python-dotenv>=1.0.1
 numpy>=1.26
 Pillow>=10.0.0
+openai>=1.30.0
