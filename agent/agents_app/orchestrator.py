@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Iterator
+
 from memory.schemas import ActiveGoal
 from memory.store import MemoryStore
 
@@ -31,3 +33,14 @@ class Orchestrator:
             goal.status = "complete"
 
         return response
+
+    def run_stream(self, user_text: str) -> Iterator[str]:
+        """Yield reply chunks as the planner produces them."""
+        self._memory.set_goal(ActiveGoal(description=user_text))
+        snapshot = self._memory.snapshot()
+        try:
+            yield from self._planner.run_stream(user_text, snapshot)
+        finally:
+            goal = self._memory.get_goal()
+            if goal is not None and goal.status == "active":
+                goal.status = "complete"

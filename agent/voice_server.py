@@ -28,6 +28,8 @@ import tempfile
 import threading
 import time
 import uuid
+import wave
+from concurrent.futures import Future, ThreadPoolExecutor
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_file
@@ -49,7 +51,6 @@ _USE_NEW_PIPELINE = os.environ.get("LEGACY_LOOP", "0") != "1"
 if _USE_NEW_PIPELINE:
     from agents_app.orchestrator import Orchestrator  # noqa: E402
     from agents_app.sdk_agents import (  # noqa: E402
-        DialogueAgent,
         PlannerAgent,
         _make_agent_client,
         _use_openai_compat,
@@ -63,7 +64,8 @@ if _USE_NEW_PIPELINE:
 
 load_dotenv()
 
-WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "base")
+WHISPER_MODEL_NAME = os.environ.get("WHISPER_MODEL", "small")
+WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "en")
 TTS_VOICE = os.environ.get("TTS_VOICE", "Samantha")  # any macOS `say` voice
 LISTEN_HOST = os.environ.get("VOICE_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("VOICE_PORT", "5050"))
@@ -126,9 +128,8 @@ def _connect_robot():
         )
         registry = build_registry()
         oa_client = _make_agent_client() if _use_openai_compat() else None
-        dialogue = DialogueAgent(oa_client)
         planner = PlannerAgent(registry, ctx, client=oa_client)
-        _robot_state["orchestrator"] = Orchestrator(dialogue, planner, memory)
+        _robot_state["orchestrator"] = Orchestrator(planner, memory)
         backend = "openai-compat" if oa_client else "bedrock-boto3"
         print(f"[voice] new pipeline ready [{backend}]", file=sys.stderr)
     except Exception as e:
@@ -157,7 +158,7 @@ def whisper_transcribe(wav_path: str) -> str:
             import whisper as _w
             _whisper["model"] = _w.load_model(WHISPER_MODEL_NAME)
         model = _whisper["model"]
-    result = model.transcribe(wav_path, fp16=False)
+    result = model.transcribe(wav_path, fp16=False, language=WHISPER_LANGUAGE)
     return (result.get("text") or "").strip()
 
 
@@ -192,6 +193,33 @@ def tts_to_wav(text: str) -> bytes:
             os.unlink(out)
         except Exception:
             pass
+
+
+# Background pool for `say` invocations. Each chunk is independent so they
+# can run in parallel with the LLM's next-token generation. 4 workers covers
+# the typical sentence-count of a reply without spawning unbounded `say`s.
+_tts_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tts")
+
+
+def _concat_wavs(blobs: list[bytes]) -> bytes:
+    """Stitch per-sentence WAVs into one WAV. All blobs come from the same
+    `say` invocation flags (LEI16@22050 mono) so headers are identical and
+    we can splice raw PCM frames."""
+    if not blobs:
+        return b""
+    if len(blobs) == 1:
+        return blobs[0]
+    out_buf = io.BytesIO()
+    with wave.open(out_buf, "wb") as w_out:
+        with wave.open(io.BytesIO(blobs[0]), "rb") as w0:
+            w_out.setnchannels(w0.getnchannels())
+            w_out.setsampwidth(w0.getsampwidth())
+            w_out.setframerate(w0.getframerate())
+            w_out.writeframes(w0.readframes(w0.getnframes()))
+        for blob in blobs[1:]:
+            with wave.open(io.BytesIO(blob), "rb") as w_n:
+                w_out.writeframes(w_n.readframes(w_n.getnframes()))
+    return out_buf.getvalue()
 
 
 # Cache TTS audio between /talk and /tts. Bytes-only, dict-ordered so we can
@@ -498,27 +526,42 @@ def talk():
 
     print(f"[voice] heard: {transcript!r}", file=sys.stderr)
 
+    reply_parts: list[str] = []
+    tts_futures: list[Future] = []
     with _robot_state["lock"]:
         try:
             orch = _robot_state.get("orchestrator")
             if orch is not None:
-                reply = orch.run(transcript)
+                # Stream the planner's reply: each sentence-sized chunk is
+                # handed to `say` in the background as soon as it arrives, so
+                # TTS overlaps with the model's next-token generation. Total
+                # wall time ≈ max(model_time, sum_of_tts_after_first_chunk).
+                for chunk in orch.run_stream(transcript):
+                    reply_parts.append(chunk)
+                    tts_futures.append(_tts_pool.submit(tts_to_wav, chunk))
             else:
-                reply = run_once(
+                full = run_once(
                     transcript,
                     _robot_state["robot"],
                     _robot_state["motion"],
                     _robot_state["follow"],
+                    _robot_state["basic_goal"],
                 )
+                reply_parts.append(full)
+                tts_futures.append(_tts_pool.submit(tts_to_wav, full))
         except Exception as e:
-            reply = f"(agent error: {type(e).__name__}: {e})"
+            err = f"(agent error: {type(e).__name__}: {e})"
+            reply_parts.append(err)
+            tts_futures.append(_tts_pool.submit(tts_to_wav, err))
+    reply = " ".join(p.strip() for p in reply_parts if p.strip())
     t_agent = time.time()
 
     print(f"[voice] reply: {reply[:120]!r}", file=sys.stderr)
 
     tts_id = uuid.uuid4().hex
     try:
-        _tts_cache_put(tts_id, tts_to_wav(reply or ""))
+        wav_blobs = [f.result() for f in tts_futures]
+        _tts_cache_put(tts_id, _concat_wavs(wav_blobs))
     except Exception as e:
         print(f"[voice] tts failed: {e}", file=sys.stderr)
         tts_id = None

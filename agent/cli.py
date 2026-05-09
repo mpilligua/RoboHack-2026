@@ -281,10 +281,17 @@ def main() -> None:
                 continue
             try:
                 if orchestrator is not None:
-                    answer = orchestrator.run(line)
+                    # Stream chunks so the first sentence appears within ~1s
+                    # instead of waiting for the whole reply.
+                    parts: list[str] = []
+                    for chunk in orchestrator.run_stream(line):
+                        parts.append(chunk)
+                        print(chunk, flush=True)
+                    if not parts:
+                        print("(no response)")
                 else:
                     answer = run_once(line, robot, motion, follow, basic_goal)
-                print(answer)
+                    print(answer)
             except KeyboardInterrupt:
                 # User hit Ctrl-C mid-tool. Stop motion and following, ask again.
                 print("\n[interrupted — stopping motion + follow]", file=sys.stderr)

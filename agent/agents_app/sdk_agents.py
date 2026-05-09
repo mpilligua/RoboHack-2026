@@ -11,11 +11,28 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+from typing import Iterator
 
 from .sdk_tools import PLANNER_TOOLS, PLANNER_TOOLS_BEDROCK, dispatch_tool
 from tools.base import ToolContext
 from tools.registry import ToolRegistry
+from vlm import make_client
+
+
+# Cut on `. `, `! `, `? ` or newline so each chunk is a self-contained clause
+# that `say` can synthesize without sounding clipped.
+_SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+|\n+')
+
+
+def _sentence_chunks(buf: str) -> tuple[list[str], str]:
+    """Split buf into completed sentences + remaining tail. The tail is
+    whatever didn't reach a terminator yet; caller keeps it for the next delta."""
+    parts = _SENTENCE_SPLIT.split(buf)
+    if len(parts) == 1:
+        return [], buf
+    return [p for p in parts[:-1] if p.strip()], parts[-1]
 
 DIALOGUE_SYSTEM = """\
 You are the dialogue layer of a quadruped guide-dog robot assistant.
@@ -90,7 +107,6 @@ class DialogueAgent:
             return {"intent": "unknown", "goal": user_text}
 
     def _run_boto3(self, user_text: str) -> dict:
-        from vlm import make_client
         bedrock = make_client()
         try:
             resp = bedrock.converse(
@@ -126,6 +142,15 @@ class PlannerAgent:
         if _use_openai_compat() and self._client is not None:
             return self._run_openai(goal, memory_snapshot)
         return self._run_boto3(goal, memory_snapshot)
+
+    def run_stream(self, goal: str, memory_snapshot: dict) -> Iterator[str]:
+        """Yield text chunks (sentence-sized) as soon as they arrive from
+        the model. Tool-loop steps don't emit; only the final answer streams."""
+        if _use_openai_compat() and self._client is not None:
+            # OpenAI-compat streaming not implemented — fall back to one-shot.
+            yield self._run_openai(goal, memory_snapshot)
+            return
+        yield from self._run_boto3_stream(goal, memory_snapshot)
 
     def _run_openai(self, goal: str, memory_snapshot: dict) -> str:
         system_content = PLANNER_SYSTEM + "\n\nCurrent robot memory:\n" + json.dumps(memory_snapshot, indent=2)
@@ -163,7 +188,6 @@ class PlannerAgent:
         return "(agent: reached max steps)"
 
     def _run_boto3(self, goal: str, memory_snapshot: dict) -> str:
-        from vlm import make_client
         bedrock = make_client()
         system_text = PLANNER_SYSTEM + "\n\nCurrent robot memory:\n" + json.dumps(memory_snapshot, indent=2)
         system = [{"text": system_text}]
@@ -205,3 +229,102 @@ class PlannerAgent:
             messages.append({"role": "user", "content": tool_results})
 
         return "(agent: reached max steps)"
+
+    def _run_boto3_stream(self, goal: str, memory_snapshot: dict) -> Iterator[str]:
+        """Same loop as _run_boto3, but the FINAL turn (no more tool_use) is
+        opened with converse_stream so caller can start TTS-ing while the
+        model is still generating."""
+        bedrock = make_client()
+        system_text = PLANNER_SYSTEM + "\n\nCurrent robot memory:\n" + json.dumps(memory_snapshot, indent=2)
+        system = [{"text": system_text}]
+        messages: list[dict] = [{"role": "user", "content": [{"text": goal}]}]
+        tool_config = {"tools": PLANNER_TOOLS_BEDROCK}
+
+        for _ in range(self._max_steps):
+            # We can't know if this turn will be the final one without asking
+            # the model, so we always use the streaming API and decide what to
+            # do based on the stop reason as the stream drains.
+            resp = bedrock.converse_stream(
+                modelId=_bedrock_model(),
+                system=system,
+                messages=messages,
+                toolConfig=tool_config,
+                inferenceConfig={"maxTokens": 1024},
+            )
+
+            assembled_content: list[dict] = []
+            current_text = ""
+            current_tool: dict | None = None
+            current_tool_input = ""
+            stop_reason = None
+            text_buffer = ""  # for sentence-chunk yielding
+
+            for event in resp["stream"]:
+                if "contentBlockStart" in event:
+                    start = event["contentBlockStart"].get("start", {})
+                    if "toolUse" in start:
+                        current_tool = {
+                            "toolUseId": start["toolUse"]["toolUseId"],
+                            "name": start["toolUse"]["name"],
+                        }
+                        current_tool_input = ""
+                elif "contentBlockDelta" in event:
+                    delta = event["contentBlockDelta"]["delta"]
+                    if "text" in delta:
+                        current_text += delta["text"]
+                        text_buffer += delta["text"]
+                        chunks, text_buffer = _sentence_chunks(text_buffer)
+                        for chunk in chunks:
+                            yield chunk
+                    elif "toolUse" in delta:
+                        current_tool_input += delta["toolUse"].get("input", "")
+                elif "contentBlockStop" in event:
+                    if current_tool is not None:
+                        try:
+                            parsed_input = json.loads(current_tool_input or "{}")
+                        except json.JSONDecodeError:
+                            parsed_input = {}
+                        assembled_content.append({
+                            "toolUse": {
+                                "toolUseId": current_tool["toolUseId"],
+                                "name": current_tool["name"],
+                                "input": parsed_input,
+                            }
+                        })
+                        current_tool = None
+                        current_tool_input = ""
+                    elif current_text:
+                        assembled_content.append({"text": current_text})
+                        current_text = ""
+                elif "messageStop" in event:
+                    stop_reason = event["messageStop"].get("stopReason")
+
+            # Flush trailing text that didn't end with a sentence terminator.
+            if text_buffer.strip():
+                yield text_buffer
+
+            messages.append({"role": "assistant", "content": assembled_content})
+
+            if stop_reason != "tool_use":
+                return
+
+            tool_results = []
+            for part in assembled_content:
+                if "toolUse" not in part:
+                    continue
+                tu = part["toolUse"]
+                name = tu["name"]
+                args = tu.get("input") or {}
+                print(f"  [planner] -> {name}({args})", file=sys.stderr)
+                result_str = dispatch_tool(name, args, self._registry, self._ctx)
+                print(f"  [planner] <- {result_str[:200]}", file=sys.stderr)
+                tool_results.append({
+                    "toolResult": {
+                        "toolUseId": tu["toolUseId"],
+                        "content": [{"text": result_str}],
+                    }
+                })
+
+            messages.append({"role": "user", "content": tool_results})
+
+        yield "(agent: reached max steps)"
