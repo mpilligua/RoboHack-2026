@@ -27,6 +27,8 @@ class Detection:
     id: int
     bbox: list[float]  # [x1, y1, x2, y2]
     conf: Optional[float]
+    label: Optional[str] = None  # YOLO COCO class name, e.g. "chair", "person"
+    cls: Optional[int] = None    # YOLO class index
 
 
 class Lite3Follow:
@@ -51,7 +53,13 @@ class Lite3Follow:
         try:
             payload = json.loads(msg["data"])
             dets = [
-                Detection(id=int(d["id"]), bbox=list(d["bbox"]), conf=d.get("conf"))
+                Detection(
+                    id=int(d["id"]),
+                    bbox=list(d["bbox"]),
+                    conf=d.get("conf"),
+                    label=d.get("label"),
+                    cls=d.get("cls"),
+                )
                 for d in payload
             ]
         except Exception:
@@ -64,7 +72,14 @@ class Lite3Follow:
             return list(self._dets)
 
     def follow(self, target_id: int) -> None:
+        """Follow a target indefinitely (won't auto-stop)."""
         self._target_pub.publish(roslibpy.Message({"data": str(int(target_id))}))
+
+    def goto(self, target_id: int) -> None:
+        """Drive toward a target and auto-stop when close (bbox ≥ 20% of frame)."""
+        self._target_pub.publish(
+            roslibpy.Message({"data": f"goto:{int(target_id)}"})
+        )
 
     def stop(self) -> None:
         self._target_pub.publish(roslibpy.Message({"data": "stop"}))

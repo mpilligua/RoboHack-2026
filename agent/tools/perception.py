@@ -164,33 +164,61 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         {},
     ),
     _spec(
-        "list_people",
+        "list_visible_objects",
         (
-            "Look at the live tracker view and return a description of each "
-            "detected person, keyed by their YOLO id. Use this when the user "
-            "wants to start following someone — call this first to figure "
-            "out which YOLO id matches the user's description (e.g. 'the "
-            "woman in red'). The tracker must be running."
+            "List all things YOLO currently sees, with their YOLO id, COCO "
+            "class label (person, chair, bottle, …), and a one-line VLM "
+            "description (clothes, colors, position) generated from the "
+            "current camera frame. Call this first whenever the user wants "
+            "to follow someone or go to an object, so you can pick the "
+            "right id. The tracker must be running."
         ),
         {},
     ),
     _spec(
         "follow_person",
         (
-            "Tell the tracker to follow a specific YOLO id. Get the id from "
-            "list_people first. The robot must be standing in walk mode."
+            "Continuously follow a moving target. The dog tracks the YOLO id "
+            "and walks toward it indefinitely — does NOT auto-stop. Use this "
+            "for 'follow me' / 'follow that person'. Pick the id from "
+            "list_visible_objects. Call stop_tracking when done."
         ),
         {
             "yolo_id": {
                 "type": "integer",
-                "description": "The YOLO id of the person to follow.",
+                "description": "YOLO tracker id of the person to follow.",
             }
         },
         required=["yolo_id"],
     ),
     _spec(
-        "stop_following",
-        "Tell the tracker to stop following anyone.",
+        "go_to_object",
+        (
+            "One-shot: walk to a stationary object (chair, door, table, "
+            "bottle...) and STOP AUTOMATICALLY when close. Stops based on "
+            "depth-camera reading inside the bbox (default 0.8 m). Use "
+            "this for 'go to the chair', 'walk to the door'. Pick the id "
+            "from list_visible_objects. Returns immediately; the dog "
+            "finishes the approach on its own."
+        ),
+        {
+            "yolo_id": {
+                "type": "integer",
+                "description": "YOLO tracker id of the object to approach.",
+            },
+            "stop_distance_m": {
+                "type": "number",
+                "description": "Stop when median bbox depth ≤ this (meters). Default 0.8.",
+            },
+        },
+        required=["yolo_id"],
+    ),
+    _spec(
+        "stop_tracking",
+        (
+            "Stop whatever the tracker is doing — both follow_person and "
+            "go_to_object. Safe to call at any time."
+        ),
         {},
     ),
 ]
@@ -303,37 +331,40 @@ def _require_follow(follow):
         )
 
 
-def _list_people(robot, motion, follow, vlm, args: dict) -> str:
+def _list_visible_objects(robot, motion, follow, vlm, args: dict) -> str:
     _require_follow(follow)
     dets = follow.get_detections()
     if not dets:
-        return json.dumps({"people": [], "note": "no people currently detected"})
+        return json.dumps({"objects": [], "note": "nothing currently detected"})
 
-    # Use the regular RGB camera frame (same physical camera YOLO sees) plus
-    # the YOLO bbox list. The VLM gets the raw image and the bboxes as text;
-    # it correlates them spatially.
     jpeg = robot.rgb_jpeg_b64()
+    width = robot.get_rgb().width
     bbox_list = ", ".join(
-        f"id {d.id} at bbox {[int(v) for v in d.bbox]}" for d in dets
+        f"id {d.id} (label {d.label!r}) at bbox {[int(v) for v in d.bbox]}"
+        for d in dets
     )
     prompt = (
         f"This image is from a guide-dog robot at knee height. A YOLO "
-        f"tracker has detected {len(dets)} people in this frame. Their "
-        f"bounding boxes (x1, y1, x2, y2 in image pixels) and tracker "
-        f"ids are: {bbox_list}. The image is {robot.get_rgb().width} "
-        f"pixels wide. For each id, give a one-sentence description of "
-        f"that specific person — clothes, colors, position (left / "
-        f"center / right). Return strict JSON: {{\"people\": [{{\"id\": "
-        f"<int>, \"description\": \"...\"}}]}}. Use only the listed ids."
+        f"tracker has detected {len(dets)} objects. The detections are: "
+        f"{bbox_list}. The image is {width} pixels wide. For each id, "
+        f"give a one-sentence description that includes the label (already "
+        f"shown above) and any distinguishing detail — color, material, "
+        f"position (left / center / right), what it's near. Return strict "
+        f"JSON: {{\"objects\": [{{\"id\": <int>, \"label\": \"<coco>\", "
+        f"\"description\": \"...\"}}]}}. Use only the listed ids."
     )
-    raw = vlm_describe(vlm, jpeg, prompt, max_tokens=600)
+    raw = vlm_describe(vlm, jpeg, prompt, max_tokens=700)
     return json.dumps(
         {
-            "yolo_ids": [d.id for d in dets],
+            "yolo_summary": [
+                {"id": d.id, "label": d.label, "bbox": [int(v) for v in d.bbox]}
+                for d in dets
+            ],
             "vlm_descriptions_raw": raw,
             "note": (
-                "Match the user's description to one of the yolo_ids above, "
-                "then call follow_person with that id."
+                "Match the user's request to one yolo id (e.g. 'go to the "
+                "wooden chair on the right' → look at descriptions and "
+                "labels), then call track_object with that id."
             ),
         }
     )
@@ -342,13 +373,75 @@ def _list_people(robot, motion, follow, vlm, args: dict) -> str:
 def _follow_person(robot, motion, follow, vlm, args: dict) -> str:
     _require_follow(follow)
     follow.follow(int(args["yolo_id"]))
-    return json.dumps({"ok": True, "action": "follow_person", "yolo_id": args["yolo_id"]})
+    return json.dumps(
+        {"ok": True, "action": "follow_person", "yolo_id": args["yolo_id"]}
+    )
 
 
-def _stop_following(robot, motion, follow, vlm, args: dict) -> str:
+def _go_to_object(robot, motion, follow, vlm, args: dict) -> str:
+    _require_follow(follow)
+    import threading
+    import time as _time
+    import numpy as _np
+
+    yolo_id = int(args["yolo_id"])
+    stop_distance_m = float(args.get("stop_distance_m", 0.8))
+    timeout_s = float(args.get("timeout_s", 30.0))
+
+    # Tell the tracker to start driving toward this id (open-ended).
+    follow.follow(yolo_id)
+
+    def watcher():
+        deadline = _time.time() + timeout_s
+        while _time.time() < deadline:
+            _time.sleep(0.5)
+            dets = follow.get_detections()
+            target = next((d for d in dets if d.id == yolo_id), None)
+            if target is None:
+                continue  # lost; tracker handles it
+            try:
+                rgb = robot.get_rgb(timeout_s=2.0)
+                depth = robot.get_depth(timeout_s=2.0)
+            except TimeoutError:
+                continue
+
+            # Map RGB bbox into depth-image coords (different resolutions).
+            sx = depth.width / float(rgb.width)
+            sy = depth.height / float(rgb.height)
+            x1, y1, x2, y2 = target.bbox
+            dx1 = max(0, int(x1 * sx))
+            dy1 = max(0, int(y1 * sy))
+            dx2 = min(depth.width, int(x2 * sx))
+            dy2 = min(depth.height, int(y2 * sy))
+            patch = depth.depth_mm[dy1:dy2, dx1:dx2]
+            valid = patch[(patch > 100) & (patch < 8000)]
+            if valid.size < 50:
+                continue
+            median_m = float(_np.median(valid)) / 1000.0
+            if median_m <= stop_distance_m:
+                follow.stop()
+                return
+        # Timed out without reaching distance — stop anyway for safety.
+        follow.stop()
+
+    threading.Thread(target=watcher, daemon=True).start()
+
+    return json.dumps(
+        {
+            "ok": True,
+            "action": "go_to_object",
+            "yolo_id": yolo_id,
+            "stop_distance_m": stop_distance_m,
+            "timeout_s": timeout_s,
+            "note": "Dog walks toward target; will auto-stop when median depth in bbox <= stop_distance_m.",
+        }
+    )
+
+
+def _stop_tracking(robot, motion, follow, vlm, args: dict) -> str:
     _require_follow(follow)
     follow.stop()
-    return json.dumps({"ok": True, "action": "stop_following"})
+    return json.dumps({"ok": True, "action": "stop_tracking"})
 
 
 _HANDLERS = {
@@ -361,9 +454,10 @@ _HANDLERS = {
     "walk_forward": _walk_forward,
     "walk_backward": _walk_backward,
     "turn_left": _turn_left,
-    "list_people": _list_people,
+    "list_visible_objects": _list_visible_objects,
     "follow_person": _follow_person,
-    "stop_following": _stop_following,
+    "go_to_object": _go_to_object,
+    "stop_tracking": _stop_tracking,
     "turn_right": _turn_right,
     "stop_motion": _stop_motion,
 }

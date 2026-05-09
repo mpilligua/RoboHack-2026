@@ -62,10 +62,11 @@ class Pose:
 
 
 class Lite3Robot:
-    """Thin synchronous wrapper around rosbridge subscriptions.
+    """rosbridge wrapper that fetches frames on demand only.
 
-    Each topic is cached as the most-recent message; `get_*()` returns the
-    cached frame or blocks briefly waiting for the first one.
+    To keep WiFi bandwidth low (camera frames are ~35 MB/s raw at 30 Hz),
+    we subscribe → wait for one message → unsubscribe per call. Idle cost
+    is zero; per-call latency is +100–300 ms.
     """
 
     def __init__(
@@ -76,10 +77,11 @@ class Lite3Robot:
     ) -> None:
         self._client = roslibpy.Ros(host=host, port=port)
         self._lock = threading.Lock()
+        # Last fetched frames are cached for status reporting only — we don't
+        # auto-update them, so `get_status` can show "rgb_age_s = 5s ago" etc.
         self._rgb: Optional[RGBFrame] = None
         self._depth: Optional[DepthFrame] = None
         self._pose: Optional[Pose] = None
-        self._battery: Optional[float] = None
 
         self._client.run(timeout=connect_timeout_s)
         if not self._client.is_connected:
@@ -88,26 +90,40 @@ class Lite3Robot:
                 "Is rosbridge_websocket running on the robot?"
             )
 
-        self._subs = [
-            self._subscribe(RGB_TOPIC, "sensor_msgs/Image", self._on_rgb),
-            self._subscribe(DEPTH_TOPIC, "sensor_msgs/Image", self._on_depth),
-            self._subscribe(ODOM_TOPIC, "nav_msgs/Odometry", self._on_odom),
-        ]
-
         self._cmd_vel = roslibpy.Topic(
             self._client, CMD_VEL_TOPIC, "geometry_msgs/Twist"
         )
         self._cmd_vel.advertise()
 
-    # ------------------------------------------------------------------ subs
+    def _fetch_one(self, topic_name: str, msg_type: str, timeout_s: float):
+        """Subscribe, wait for one message, unsubscribe. Returns the dict or
+        raises TimeoutError."""
+        sub = roslibpy.Topic(self._client, topic_name, msg_type)
+        evt = threading.Event()
+        holder: dict = {}
 
-    def _subscribe(self, topic: str, msg_type: str, cb):
-        sub = roslibpy.Topic(self._client, topic, msg_type)
+        def cb(msg: dict) -> None:
+            if not evt.is_set():
+                holder["msg"] = msg
+                evt.set()
+
         sub.subscribe(cb)
-        return sub
+        try:
+            if not evt.wait(timeout=timeout_s):
+                raise TimeoutError(
+                    f"No message on {topic_name} within {timeout_s}s"
+                )
+            return holder["msg"]
+        finally:
+            try:
+                sub.unsubscribe()
+            except Exception:
+                pass
 
-    def _on_rgb(self, msg: dict) -> None:
-        # sensor_msgs/Image with encoding rgb8 or bgr8; data is base64.
+    # ------------------------------------------------------------- public API
+
+    def get_rgb(self, timeout_s: float = 5.0) -> RGBFrame:
+        msg = self._fetch_one(RGB_TOPIC, "sensor_msgs/Image", timeout_s)
         data = base64.b64decode(msg["data"])
         h, w = msg["height"], msg["width"]
         encoding = msg.get("encoding", "rgb8")
@@ -115,64 +131,44 @@ class Lite3Robot:
         if encoding == "bgr8":
             arr = arr[:, :, ::-1]
         img = Image.fromarray(arr, mode="RGB")
+        frame = RGBFrame(image=img, width=w, height=h, stamp=time.time())
         with self._lock:
-            self._rgb = RGBFrame(image=img, width=w, height=h, stamp=time.time())
+            self._rgb = frame
+        return frame
 
-    def _on_depth(self, msg: dict) -> None:
-        # 16UC1, depth in millimeters.
+    def get_depth(self, timeout_s: float = 5.0) -> DepthFrame:
+        msg = self._fetch_one(DEPTH_TOPIC, "sensor_msgs/Image", timeout_s)
         data = base64.b64decode(msg["data"])
         h, w = msg["height"], msg["width"]
         depth = np.frombuffer(data, dtype=np.uint16).reshape(h, w).copy()
+        frame = DepthFrame(depth_mm=depth, width=w, height=h, stamp=time.time())
         with self._lock:
-            self._depth = DepthFrame(
-                depth_mm=depth, width=w, height=h, stamp=time.time()
-            )
-
-    def _on_odom(self, msg: dict) -> None:
-        p = msg["pose"]["pose"]
-        q = p["orientation"]
-        # yaw from quaternion (z-axis rotation).
-        siny_cosp = 2 * (q["w"] * q["z"] + q["x"] * q["y"])
-        cosy_cosp = 1 - 2 * (q["y"] ** 2 + q["z"] ** 2)
-        yaw = float(np.arctan2(siny_cosp, cosy_cosp))
-        with self._lock:
-            self._pose = Pose(
-                x=float(p["position"]["x"]),
-                y=float(p["position"]["y"]),
-                z=float(p["position"]["z"]),
-                yaw=yaw,
-                stamp=time.time(),
-            )
-
-    # ------------------------------------------------------------- public API
-
-    def _wait_for(self, attr: str, timeout_s: float):
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            with self._lock:
-                val = getattr(self, attr)
-            if val is not None:
-                return val
-            time.sleep(0.05)
-        return None
-
-    def get_rgb(self, timeout_s: float = 3.0) -> RGBFrame:
-        frame = self._wait_for("_rgb", timeout_s)
-        if frame is None:
-            raise TimeoutError(f"No RGB frame on {RGB_TOPIC} within {timeout_s}s")
+            self._depth = frame
         return frame
 
-    def get_depth(self, timeout_s: float = 3.0) -> DepthFrame:
-        frame = self._wait_for("_depth", timeout_s)
-        if frame is None:
-            raise TimeoutError(f"No depth frame on {DEPTH_TOPIC} within {timeout_s}s")
-        return frame
-
-    def get_rgbd(self, timeout_s: float = 3.0) -> tuple[RGBFrame, DepthFrame]:
+    def get_rgbd(self, timeout_s: float = 5.0) -> tuple[RGBFrame, DepthFrame]:
         return self.get_rgb(timeout_s), self.get_depth(timeout_s)
 
     def get_pose(self, timeout_s: float = 2.0) -> Optional[Pose]:
-        return self._wait_for("_pose", timeout_s)
+        try:
+            msg = self._fetch_one(ODOM_TOPIC, "nav_msgs/Odometry", timeout_s)
+        except TimeoutError:
+            return None
+        p = msg["pose"]["pose"]
+        q = p["orientation"]
+        siny_cosp = 2 * (q["w"] * q["z"] + q["x"] * q["y"])
+        cosy_cosp = 1 - 2 * (q["y"] ** 2 + q["z"] ** 2)
+        yaw = float(np.arctan2(siny_cosp, cosy_cosp))
+        pose = Pose(
+            x=float(p["position"]["x"]),
+            y=float(p["position"]["y"]),
+            z=float(p["position"]["z"]),
+            yaw=yaw,
+            stamp=time.time(),
+        )
+        with self._lock:
+            self._pose = pose
+        return pose
 
     def rgb_jpeg_b64(self, quality: int = 85, timeout_s: float = 3.0) -> str:
         """RGB frame encoded as base64 JPEG — feed straight to a VLM."""
@@ -244,11 +240,6 @@ class Lite3Robot:
             self.stop()
         except Exception:
             pass
-        for sub in self._subs:
-            try:
-                sub.unsubscribe()
-            except Exception:
-                pass
         try:
             self._cmd_vel.unadvertise()
         except Exception:
