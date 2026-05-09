@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from robot import Lite3Robot
+from robot import Lite3Motion, Lite3Robot
 from vlm import vlm_describe
 
 
@@ -88,10 +88,62 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         ),
         {},
     ),
+    _spec(
+        "walk_forward",
+        (
+            "Walk the robot forward for a short duration. The robot must "
+            "already be standing in walk mode with auto mode enabled. "
+            "Always describe what you see first if there's any chance of "
+            "obstacles ahead. Speed is clamped to 0.3 m/s, duration to 2 s."
+        ),
+        {
+            "duration_s": {
+                "type": "number",
+                "description": "How long to walk, in seconds. Try 0.5 to 2.",
+            },
+            "speed": {
+                "type": "number",
+                "description": "Forward speed in m/s, default 0.15.",
+            },
+        },
+        required=["duration_s"],
+    ),
+    _spec(
+        "walk_backward",
+        "Walk the robot backward for a short duration.",
+        {
+            "duration_s": {"type": "number"},
+            "speed": {"type": "number", "description": "m/s, default 0.15."},
+        },
+        required=["duration_s"],
+    ),
+    _spec(
+        "turn_left",
+        "Rotate the robot in place to the left (counter-clockwise).",
+        {
+            "duration_s": {"type": "number"},
+            "omega": {"type": "number", "description": "rad/s, default 0.4."},
+        },
+        required=["duration_s"],
+    ),
+    _spec(
+        "turn_right",
+        "Rotate the robot in place to the right (clockwise).",
+        {
+            "duration_s": {"type": "number"},
+            "omega": {"type": "number", "description": "rad/s, default 0.4."},
+        },
+        required=["duration_s"],
+    ),
+    _spec(
+        "stop_motion",
+        "Immediately stop all motion. Use as a safety command.",
+        {},
+    ),
 ]
 
 
-def _describe_scene(robot: Lite3Robot, vlm, args: dict) -> str:
+def _describe_scene(robot: Lite3Robot, motion, vlm, args: dict) -> str:
     focus = args.get("focus") or "the scene"
     prompt = (
         f"You are the perception system of an assistive guide-dog robot at "
@@ -103,7 +155,7 @@ def _describe_scene(robot: Lite3Robot, vlm, args: dict) -> str:
     return vlm_describe(vlm, jpeg, prompt)
 
 
-def _read_label(robot: Lite3Robot, vlm, args: dict) -> str:
+def _read_label(robot: Lite3Robot, motion, vlm, args: dict) -> str:
     item = args["item_description"]
     prompt = (
         f"Read every piece of text visible on '{item}' in this image. "
@@ -114,11 +166,11 @@ def _read_label(robot: Lite3Robot, vlm, args: dict) -> str:
     return vlm_describe(vlm, jpeg, prompt)
 
 
-def _get_rgbd_summary(robot: Lite3Robot, vlm, args: dict) -> str:
+def _get_rgbd_summary(robot: Lite3Robot, motion, vlm, args: dict) -> str:
     return json.dumps(robot.depth_summary())
 
 
-def _get_pose(robot: Lite3Robot, vlm, args: dict) -> str:
+def _get_pose(robot: Lite3Robot, motion, vlm, args: dict) -> str:
     pose = robot.get_pose()
     if pose is None:
         return json.dumps({"error": "no odometry yet"})
@@ -127,7 +179,7 @@ def _get_pose(robot: Lite3Robot, vlm, args: dict) -> str:
     )
 
 
-def _get_status(robot: Lite3Robot, vlm, args: dict) -> str:
+def _get_status(robot: Lite3Robot, motion, vlm, args: dict) -> str:
     import time
 
     now = time.time()
@@ -138,11 +190,47 @@ def _get_status(robot: Lite3Robot, vlm, args: dict) -> str:
     return json.dumps(
         {
             "rosbridge_connected": robot._client.is_connected,
+            "motion_connected": motion is not None and motion._client.is_connected,
             "rgb_age_s": rgb_age,
             "depth_age_s": depth_age,
             "have_pose": pose is not None,
         }
     )
+
+
+def _require_motion(motion):
+    if motion is None:
+        raise RuntimeError("motion adapter not connected — start the foxy rosbridge on port 9091")
+
+
+def _walk_forward(robot, motion, vlm, args: dict) -> str:
+    _require_motion(motion)
+    motion.forward(speed=args.get("speed", 0.15), duration_s=args["duration_s"])
+    return json.dumps({"ok": True, "action": "walk_forward", "duration_s": args["duration_s"]})
+
+
+def _walk_backward(robot, motion, vlm, args: dict) -> str:
+    _require_motion(motion)
+    motion.backward(speed=args.get("speed", 0.15), duration_s=args["duration_s"])
+    return json.dumps({"ok": True, "action": "walk_backward", "duration_s": args["duration_s"]})
+
+
+def _turn_left(robot, motion, vlm, args: dict) -> str:
+    _require_motion(motion)
+    motion.turn_left(omega=args.get("omega", 0.4), duration_s=args["duration_s"])
+    return json.dumps({"ok": True, "action": "turn_left", "duration_s": args["duration_s"]})
+
+
+def _turn_right(robot, motion, vlm, args: dict) -> str:
+    _require_motion(motion)
+    motion.turn_right(omega=args.get("omega", 0.4), duration_s=args["duration_s"])
+    return json.dumps({"ok": True, "action": "turn_right", "duration_s": args["duration_s"]})
+
+
+def _stop_motion(robot, motion, vlm, args: dict) -> str:
+    _require_motion(motion)
+    motion.stop()
+    return json.dumps({"ok": True, "action": "stop"})
 
 
 _HANDLERS = {
@@ -151,14 +239,19 @@ _HANDLERS = {
     "get_rgbd_summary": _get_rgbd_summary,
     "get_pose": _get_pose,
     "get_status": _get_status,
+    "walk_forward": _walk_forward,
+    "walk_backward": _walk_backward,
+    "turn_left": _turn_left,
+    "turn_right": _turn_right,
+    "stop_motion": _stop_motion,
 }
 
 
-def dispatch(name: str, args: dict, robot: Lite3Robot, vlm) -> str:
+def dispatch(name: str, args: dict, robot: Lite3Robot, motion, vlm) -> str:
     handler = _HANDLERS.get(name)
     if handler is None:
         return json.dumps({"error": f"unknown tool: {name}"})
     try:
-        return handler(robot, vlm, args)
+        return handler(robot, motion, vlm, args)
     except Exception as e:
         return json.dumps({"error": f"{type(e).__name__}: {e}"})
