@@ -25,3 +25,4 @@ ENV/
 *.swp
 *.swo
 src/*
+lite_cog_ros2/*
