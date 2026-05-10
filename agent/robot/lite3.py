@@ -28,10 +28,10 @@ from .rgbd_naive import compute_depth_at_rgb_pixel_naive
 
 
 RGB_TOPIC = "/camera/color/image_raw"
-# Note: this Lite3 publishes depth in the camera's own frame, not aligned to
-# RGB. Pixel-perfect overlay would need /camera/aligned_depth_to_color, which
-# isn't published here. Good enough for distance summaries.
-DEPTH_TOPIC = "/camera/aligned_depth_to_color/image_raw"
+# Raw depth topic (not aligned to RGB). Pixel-perfect overlay would need
+# /camera/aligned_depth_to_color, but that isn't always published.
+# Good enough for distance summaries and obstacle detection.
+DEPTH_TOPIC = "/camera/depth/image_raw"
 IMU_TOPIC = "/imu/data"
 ODOM_TOPIC = "/leg_odom"
 JOINT_TOPIC = "/joint_states"
@@ -340,14 +340,14 @@ class Lite3Robot:
 
     def rgb_jpeg_b64(self, quality: int = 85, timeout_s: float = 12.0) -> str:
         """RGB frame encoded as base64 JPEG — feed straight to a VLM."""
-        frame = self.get_rgb(timeout_s, max_age_s)
+        frame = self.get_rgb(timeout_s)
         buf = io.BytesIO()
         frame.image.save(buf, format="JPEG", quality=quality)
         return base64.b64encode(buf.getvalue()).decode("ascii")
 
     def depth_summary(self, timeout_s: float = 12.0) -> dict:
         """Compact depth stats — closest object, center distance, etc."""
-        frame = self.get_depth(timeout_s, max_age_s)
+        frame = self.get_depth(timeout_s)
         d = frame.depth_mm
         valid = d[(d > 0) & (d < 10_000)]
         cx, cy = frame.width // 2, frame.height // 2
