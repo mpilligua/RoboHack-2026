@@ -88,11 +88,7 @@ def _connect_robot():
     """Mirror cli.py's connection + orchestrator setup so voice and CLI run the
     exact same agent (with safety supervisor, dialogue/planner split, etc.)."""
     host = os.environ.get("ROS_BRIDGE_HOST", "192.168.1.103")
-    cam_port = int(os.environ.get("ROS_BRIDGE_PORT", "9090"))
     motion_port = int(os.environ.get("ROS2_BRIDGE_PORT", "9091"))
-
-    print(f"[voice] connecting to camera bridge ws://{host}:{cam_port} …", file=sys.stderr)
-    _robot_state["robot"] = Lite3Robot(host=host, port=cam_port)
 
     try:
         print(f"[voice] connecting to ROS 2 bridge ws://{host}:{motion_port} …", file=sys.stderr)
@@ -101,6 +97,9 @@ def _connect_robot():
         print(f"[voice] ROS 2 bridge unavailable: {e}", file=sys.stderr)
 
     ros2 = _robot_state["ros2_client"]
+    print(f"[voice] connecting to ROS 2 perception bridge ws://{host}:{motion_port} …", file=sys.stderr)
+    _robot_state["robot"] = Lite3Robot(host=host, port=motion_port, ros_client=ros2)
+
     if ros2 is not None:
         for name, cls in (("motion", Lite3Motion), ("follow", Lite3Follow), ("basic_goal", Lite3BasicGoal)):
             try:

@@ -17,8 +17,11 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
+import json
+
 import numpy as np
 import roslibpy
+import websocket
 from PIL import Image
 
 from .rgbd_naive import compute_depth_at_rgb_pixel_naive
@@ -28,7 +31,7 @@ RGB_TOPIC = "/camera/color/image_raw"
 # Note: this Lite3 publishes depth in the camera's own frame, not aligned to
 # RGB. Pixel-perfect overlay would need /camera/aligned_depth_to_color, which
 # isn't published here. Good enough for distance summaries.
-DEPTH_TOPIC = "/camera/depth/image_rect_raw"
+DEPTH_TOPIC = "/camera/aligned_depth_to_color/image_raw"
 IMU_TOPIC = "/imu/data"
 ODOM_TOPIC = "/leg_odom"
 JOINT_TOPIC = "/joint_states"
@@ -74,13 +77,37 @@ class Lite3Robot:
     def __init__(
         self,
         host: str = "192.168.1.103",
-        port: int = 9090,
+        port: int = 9091,
         connect_timeout_s: float = 10.0,
         *,
+        ros_client: Optional[roslibpy.Ros] = None,
         max_rgb_hz: Optional[float] = None,
         max_depth_hz: Optional[float] = None,
     ) -> None:
+        # roslibpy client for cmd_vel publish and pose subscription.
         self._client = roslibpy.Ros(host=host, port=port)
+        self._client.run(timeout=connect_timeout_s)
+        if not self._client.is_connected:
+            raise RuntimeError(
+                f"Could not connect to rosbridge at ws://{host}:{port}. "
+                "Is rosbridge_websocket running on the robot?"
+            )
+
+        # Shared state client for pose subscription — if provided, reuse the
+        # caller's ros2 connection so pose lives on a separate socket from images.
+        if ros_client is not None:
+            self._state_client = ros_client
+            self._owns_state_client = False
+        else:
+            self._state_client = self._client
+            self._owns_state_client = False  # same as perception client; closed together
+
+        # Persistent websocket-client connection for image fetches (bypasses the
+        # shared Twisted reactor that roslibpy owns — large frames would starve it).
+        ws_url = f"ws://{host}:{port}"
+        self._img_ws = websocket.create_connection(ws_url, timeout=connect_timeout_s)
+        self._img_ws_lock = threading.Lock()
+
         self._lock = threading.Lock()
         # Max fetch rates for RGB/depth (pose is uncapped). None or <=0 = unlimited.
         self._max_rgb_hz = max_rgb_hz
@@ -93,17 +120,39 @@ class Lite3Robot:
         self._depth: Optional[DepthFrame] = None
         self._pose: Optional[Pose] = None
 
-        self._client.run(timeout=connect_timeout_s)
-        if not self._client.is_connected:
-            raise RuntimeError(
-                f"Could not connect to rosbridge at ws://{host}:{port}. "
-                "Is rosbridge_websocket running on the robot?"
-            )
-
         self._cmd_vel = roslibpy.Topic(
             self._client, CMD_VEL_TOPIC, "geometry_msgs/Twist"
         )
         self._cmd_vel.advertise()
+
+        # Persistent pose subscription on the state client (separate socket from images).
+        self._pose_evt = threading.Event()
+        self._pose_sub = roslibpy.Topic(
+            self._state_client, ODOM_TOPIC, "geometry_msgs/PoseWithCovarianceStamped",
+            throttle_rate=200,  # ms → 5 Hz max; pose doesn't need higher rate
+        )
+        self._pose_sub.subscribe(self._on_pose)
+
+    def _on_pose(self, msg: dict) -> None:
+        try:
+            p = msg["pose"]["pose"]
+            pos = p["position"]
+            ori = p["orientation"]
+            siny = 2.0 * (ori["w"] * ori["z"] + ori["x"] * ori["y"])
+            cosy = 1.0 - 2.0 * (ori["y"] ** 2 + ori["z"] ** 2)
+            yaw = float(__import__("math").atan2(siny, cosy))
+            pose = Pose(
+                x=float(pos["x"]),
+                y=float(pos["y"]),
+                z=float(pos["z"]),
+                yaw=yaw,
+                stamp=time.time(),
+            )
+            with self._lock:
+                self._pose = pose
+            self._pose_evt.set()
+        except Exception:
+            pass
 
     def _respect_rgb_rate_limit(self) -> Optional[RGBFrame]:
         """Return cached RGB if we must not fetch yet; otherwise sleep until ok."""
@@ -179,81 +228,124 @@ class Lite3Robot:
             except Exception:
                 pass
 
-    # ------------------------------------------------------------- public API
+    def _fetch_rgb_depth_pair(self, timeout_s: float) -> tuple[dict, dict]:
+        """Fetch one RGB and one depth frame on the persistent image WebSocket.
 
-    def get_rgb(self, timeout_s: float = 5.0) -> RGBFrame:
-        cached = self._respect_rgb_rate_limit()
-        if cached is not None:
-            return cached
-        msg = self._fetch_one(RGB_TOPIC, "sensor_msgs/Image", timeout_s)
+        Uses websocket-client (not roslibpy/Twisted) so that large image frames
+        don't block the shared Twisted reactor that serves pose and motion topics.
+        The connection is kept open between calls; only subscribe/unsubscribe per fetch.
+        """
+        with self._img_ws_lock:
+            ws = self._img_ws
+            ws.settimeout(timeout_s)
+            ws.send(json.dumps({
+                "op": "subscribe", "id": "rgb_fetch",
+                "topic": RGB_TOPIC, "type": "sensor_msgs/Image",
+            }))
+            ws.send(json.dumps({
+                "op": "subscribe", "id": "dep_fetch",
+                "topic": DEPTH_TOPIC, "type": "sensor_msgs/Image",
+            }))
+            rgb_msg = depth_msg = None
+            deadline = time.time() + timeout_s
+            try:
+                while time.time() < deadline and (rgb_msg is None or depth_msg is None):
+                    ws.settimeout(max(0.05, deadline - time.time()))
+                    try:
+                        data = json.loads(ws.recv())
+                    except websocket.WebSocketTimeoutException:
+                        break
+                    if data.get("op") != "publish":
+                        continue
+                    topic = data.get("topic", "")
+                    if RGB_TOPIC in topic and rgb_msg is None:
+                        rgb_msg = data["msg"]
+                    elif DEPTH_TOPIC in topic and depth_msg is None:
+                        depth_msg = data["msg"]
+            finally:
+                ws.settimeout(10.0)  # reset before send so unsubscribes go through
+                try:
+                    ws.send(json.dumps({"op": "unsubscribe", "topic": RGB_TOPIC}))
+                    ws.send(json.dumps({"op": "unsubscribe", "topic": DEPTH_TOPIC}))
+                except Exception:
+                    pass
+        if rgb_msg is None:
+            raise TimeoutError(f"No message on {RGB_TOPIC} within {timeout_s}s")
+        if depth_msg is None:
+            raise TimeoutError(f"No message on {DEPTH_TOPIC} within {timeout_s}s")
+        return rgb_msg, depth_msg
+
+    def _parse_rgb_msg(self, msg: dict) -> RGBFrame:
         data = base64.b64decode(msg["data"])
         h, w = msg["height"], msg["width"]
         encoding = msg.get("encoding", "rgb8")
         arr = np.frombuffer(data, dtype=np.uint8).reshape(h, w, 3)
         if encoding == "bgr8":
             arr = arr[:, :, ::-1]
-        img = Image.fromarray(arr, mode="RGB")
-        frame = RGBFrame(image=img, width=w, height=h, stamp=time.time())
+        return RGBFrame(image=Image.fromarray(arr, mode="RGB"), width=w, height=h, stamp=time.time())
+
+    def _parse_depth_msg(self, msg: dict) -> DepthFrame:
+        data = base64.b64decode(msg["data"])
+        h, w = msg["height"], msg["width"]
+        depth = np.frombuffer(data, dtype=np.uint16).reshape(h, w).copy()
+        return DepthFrame(depth_mm=depth, width=w, height=h, stamp=time.time())
+
+    # ------------------------------------------------------------- public API
+
+    def get_rgb(self, timeout_s: float = 5.0) -> RGBFrame:
+        cached = self._respect_rgb_rate_limit()
+        if cached is not None:
+            return cached
+        rgb_msg, depth_msg = self._fetch_rgb_depth_pair(timeout_s)
+        rgb_frame = self._parse_rgb_msg(rgb_msg)
+        depth_frame = self._parse_depth_msg(depth_msg)
         with self._lock:
-            self._rgb = frame
+            self._rgb = rgb_frame
+            self._depth = depth_frame
             self._last_rgb_fetch_mono = time.monotonic()
-        return frame
+            self._last_depth_fetch_mono = time.monotonic()
+        return rgb_frame
 
     def get_depth(self, timeout_s: float = 5.0) -> DepthFrame:
         cached = self._respect_depth_rate_limit()
         if cached is not None:
             return cached
-        msg = self._fetch_one(DEPTH_TOPIC, "sensor_msgs/Image", timeout_s)
-        data = base64.b64decode(msg["data"])
-        h, w = msg["height"], msg["width"]
-        depth = np.frombuffer(data, dtype=np.uint16).reshape(h, w).copy()
-        frame = DepthFrame(depth_mm=depth, width=w, height=h, stamp=time.time())
+        rgb_msg, depth_msg = self._fetch_rgb_depth_pair(timeout_s)
+        rgb_frame = self._parse_rgb_msg(rgb_msg)
+        depth_frame = self._parse_depth_msg(depth_msg)
         with self._lock:
-            self._depth = frame
+            self._rgb = rgb_frame
+            self._depth = depth_frame
+            self._last_rgb_fetch_mono = time.monotonic()
             self._last_depth_fetch_mono = time.monotonic()
-        return frame
+        return depth_frame
 
     def get_rgbd(self, timeout_s: float = 5.0) -> tuple[RGBFrame, DepthFrame]:
-        return self.get_rgb(timeout_s), self.get_depth(timeout_s)
+        rgb_msg, depth_msg = self._fetch_rgb_depth_pair(timeout_s)
+        rgb_frame = self._parse_rgb_msg(rgb_msg)
+        depth_frame = self._parse_depth_msg(depth_msg)
+        now = time.monotonic()
+        with self._lock:
+            self._rgb = rgb_frame
+            self._depth = depth_frame
+            self._last_rgb_fetch_mono = now
+            self._last_depth_fetch_mono = now
+        return rgb_frame, depth_frame
 
     def get_pose(self, timeout_s: float = 2.0) -> Optional[Pose]:
-        try:
-            msg = self._fetch_one(ODOM_TOPIC, "nav_msgs/Odometry", timeout_s)
-        except TimeoutError:
+        if not self._pose_evt.wait(timeout=timeout_s):
             return None
-        p = msg["pose"]["pose"]
-        q = p["orientation"]
-        siny_cosp = 2 * (q["w"] * q["z"] + q["x"] * q["y"])
-        cosy_cosp = 1 - 2 * (q["y"] ** 2 + q["z"] ** 2)
-        yaw = float(np.arctan2(siny_cosp, cosy_cosp))
-        pose = Pose(
-            x=float(p["position"]["x"]),
-            y=float(p["position"]["y"]),
-            z=float(p["position"]["z"]),
-            yaw=yaw,
-            stamp=time.time(),
-        )
         with self._lock:
-            self._pose = pose
-        return pose
+            return self._pose
 
-    def rgb_jpeg_b64(
-        self,
-        quality: int = 85,
-        timeout_s: float = 3.0,
-        max_age_s: Optional[float] = None,
-    ) -> str:
+    def rgb_jpeg_b64(self, quality: int = 85, timeout_s: float = 12.0) -> str:
         """RGB frame encoded as base64 JPEG — feed straight to a VLM."""
         frame = self.get_rgb(timeout_s, max_age_s)
         buf = io.BytesIO()
         frame.image.save(buf, format="JPEG", quality=quality)
         return base64.b64encode(buf.getvalue()).decode("ascii")
 
-    def depth_summary(
-        self,
-        timeout_s: float = 3.0,
-        max_age_s: Optional[float] = None,
-    ) -> dict:
+    def depth_summary(self, timeout_s: float = 12.0) -> dict:
         """Compact depth stats — closest object, center distance, etc."""
         frame = self.get_depth(timeout_s, max_age_s)
         d = frame.depth_mm
@@ -275,7 +367,7 @@ class Lite3Robot:
         v_rgb: int,
         *,
         window_radius: int = 3,
-        timeout_s: float = 3.0,
+        timeout_s: float = 12.0,
     ) -> dict:
         """Approximate depth at an RGB pixel.
 
@@ -317,7 +409,15 @@ class Lite3Robot:
         except Exception:
             pass
         try:
+            self._pose_sub.unsubscribe()
+        except Exception:
+            pass
+        try:
             self._cmd_vel.unadvertise()
+        except Exception:
+            pass
+        try:
+            self._img_ws.close()
         except Exception:
             pass
         try:

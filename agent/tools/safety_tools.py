@@ -25,7 +25,7 @@ def handle_stop(ctx: ToolContext, args: dict) -> ToolResult:
 
 def handle_get_robot_status(ctx: ToolContext, args: dict) -> ToolResult:
     try:
-        summary = ctx.robot.depth_summary(timeout_s=2.0)
+        summary = ctx.robot.depth_summary(timeout_s=12.0)
         ctx.memory.update_robot_state(
             depth_stamp=time.time(),
             depth_min_mm=summary.get("min_mm"),

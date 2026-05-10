@@ -59,7 +59,7 @@ cp .env.example .env
 python cli.py
 ```
 
-You'll get a `>` prompt. The CLI opens **two** websocket connections total: one to ROS 1 (camera), one shared ROS 2 session for motion + follow + basic goal adapters.
+You'll get a `>` prompt. The CLI opens **one** websocket connection (ROS 2 Foxy, port 9091) shared by perception, motion, follow, and basic-goal adapters.
 
 Tune rosbridge load via `.env`:
 

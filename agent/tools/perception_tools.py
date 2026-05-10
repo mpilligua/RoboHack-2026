@@ -46,7 +46,7 @@ def handle_read_label(ctx: ToolContext, args: dict) -> ToolResult:
 
 def handle_get_rgbd_summary(ctx: ToolContext, args: dict) -> ToolResult:
     try:
-        summary = ctx.robot.depth_summary(timeout_s=3.0)
+        summary = ctx.robot.depth_summary(timeout_s=12.0)
     except Exception as e:
         return ToolResult(ok=False, tool="get_rgbd_summary", error=f"depth error: {e}")
     ctx.memory.update_robot_state(

@@ -74,8 +74,8 @@ def handle_go_to_object(ctx: ToolContext, args: dict) -> ToolResult:
                 continue
             last_seen_ts = time.time()
             try:
-                rgb = ctx.robot.get_rgb(timeout_s=2.0)
-                depth = ctx.robot.get_depth(timeout_s=2.0)
+                rgb = ctx.robot.get_rgb(timeout_s=12.0)
+                depth = ctx.robot.get_depth(timeout_s=12.0)
             except TimeoutError:
                 continue
             sx = depth.width / float(rgb.width)

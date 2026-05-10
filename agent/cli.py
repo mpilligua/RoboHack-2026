@@ -201,19 +201,10 @@ def main() -> None:
     atexit.register(release_cli_lock)
 
     host = os.environ.get("ROS_BRIDGE_HOST", "192.168.1.103")
-    cam_port = int(os.environ.get("ROS_BRIDGE_PORT", "9090"))
     motion_port = int(os.environ.get("ROS2_BRIDGE_PORT", "9091"))
 
     rgb_hz = _parse_max_hz("RGB_MAX_HZ", 2.0)
     depth_hz = _parse_max_hz("DEPTH_MAX_HZ", 2.0)
-
-    print(f"connecting to camera bridge ws://{host}:{cam_port} …", file=sys.stderr)
-    robot = Lite3Robot(
-        host=host,
-        port=cam_port,
-        max_rgb_hz=rgb_hz,
-        max_depth_hz=depth_hz,
-    )
 
     ros2_client = None
     motion = None
@@ -223,9 +214,20 @@ def main() -> None:
     try:
         print(f"connecting to ROS 2 bridge ws://{host}:{motion_port} …", file=sys.stderr)
         ros2_client = connect_ros2_rosbridge(host, motion_port)
-        print("ROS 2 bridge OK (shared by motion + follow + basic goal)", file=sys.stderr)
+        print("ROS 2 bridge OK", file=sys.stderr)
     except Exception as e:
         print(f"ROS 2 bridge unavailable: {e}", file=sys.stderr)
+
+    # Perception client: own WebSocket for image fetches; pose subscription
+    # rides on ros2_client (shared socket) to avoid starving image callbacks.
+    print(f"connecting to ROS 2 perception bridge ws://{host}:{motion_port} …", file=sys.stderr)
+    robot = Lite3Robot(
+        host=host,
+        port=motion_port,
+        max_rgb_hz=rgb_hz,
+        max_depth_hz=depth_hz,
+        ros_client=ros2_client,
+    )
 
     if ros2_client is not None:
         try:

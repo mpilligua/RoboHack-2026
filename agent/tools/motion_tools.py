@@ -28,7 +28,7 @@ def _safety_check_forward(ctx: ToolContext) -> tuple[bool, str | None, dict | No
     summary: dict | None = None
     if age > _DEPTH_FRESH_S or state.get("nearest_obstacle_mm") is None:
         try:
-            summary = ctx.robot.depth_summary(timeout_s=2.0)
+            summary = ctx.robot.depth_summary(timeout_s=12.0)
             ctx.memory.update_robot_state(
                 depth_stamp=time.time(),
                 depth_min_mm=summary.get("min_mm"),

@@ -22,7 +22,7 @@ sudo route -n add 192.168.1.0/24 192.168.2.1
 
 ```
 ssh ysc@192.168.1.103
-sudo systemctl restart realsense
+sudo systemctl restart realsense_ros2
 sleep 8
 source /opt/ros/noetic/setup.bash
 timeout 5 rostopic hz /camera/color/image_raw
@@ -30,7 +30,7 @@ timeout 5 rostopic hz /camera/color/image_raw
 
 **Expect** ~30 Hz. If empty → camera failed; check `lsusb | grep -i intel` — if nothing, the USB cable is loose, ask someone to reseat it.
 
-You can `exit` this terminal once it's working — realsense runs as a service.
+You can `exit` this terminal once it's working — realsense_ros2 runs as a service.
 
 ## 3. Robot terminal B — noetic rosbridge (camera)
 
@@ -207,7 +207,7 @@ Tweaks (env vars):
 |---|---|---|
 | Agent launch breaks other robot clients | rosbridge overloaded (burst subscriptions from multiple tools / agents) | Run only one `python cli.py`; remove stale `.cli.pid.lock` if needed; lower `RGB_MAX_HZ` / `DEPTH_MAX_HZ` in `.env` (defaults 2 Hz) |
 | `Another agent appears to be running` | Second CLI or crashed exit left lock | Stop the other process or delete `agent/.cli.pid.lock` if stale (Windows: delete manually; Unix: lock clears if PID is dead) |
-| Camera dies (`No RealSense devices were found`) | RealSense USB flake. Sometimes correlated with tracker running. | `sudo systemctl restart realsense`; if persistent, reseat USB cable |
+| Camera dies (`No RealSense devices were found`) | RealSense USB flake. Sometimes correlated with tracker running. | `sudo systemctl restart realsense_ros2`; if persistent, reseat USB cable |
 | `Failed to connect to ROS` | rosbridge died (terminal closed) | redo step 3 or 4 |
 | `Can't assign requested address` | route gone | redo step 1 |
 | `Connection refused` on 9090/9091 | rosbridge not running | step 3 / step 4 |
@@ -266,7 +266,7 @@ nc -vz localhost 9091   # for foxy
 
 ## RGB camera silently goes to 0 Hz (depth still works)
 
-Symptom — the realsense systemd service shows `active (running)`, depth is publishing
+Symptom — the realsense_ros2 systemd service shows `active (running)`, depth is publishing
 fine at 30 Hz, but `/camera/color/image_raw` has zero messages and `get_status` returns
 `rgb_age_s: null`. `journalctl -u realsense` shows lines like:
 
@@ -286,7 +286,7 @@ realsense node:
 
 ```
 sudo /sbin/modprobe -r uvcvideo && sudo /sbin/modprobe uvcvideo
-sudo systemctl restart realsense
+sudo systemctl restart realsense_ros2
 source /opt/ros/noetic/setup.bash
 sleep 10
 timeout 5 rostopic hz /camera/color/image_raw   # should now show ~30 Hz
@@ -297,7 +297,7 @@ Why each step matters:
   the kernel to drop its stuck state.
 - `modprobe uvcvideo` reloads it cleanly, which re-enumerates the camera and re-negotiates
   the USB pipes from scratch.
-- `systemctl restart realsense` then re-launches the ROS node so it can attach to the
+- `systemctl restart realsense_ros2` then re-launches the ROS node so it can attach to the
   freshly-clean device.
 - `sleep 10` gives the realsense node time to enumerate, configure streams, and start
   publishing before we test.
