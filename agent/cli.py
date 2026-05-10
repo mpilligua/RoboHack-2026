@@ -156,6 +156,10 @@ def main() -> None:
                 odom_frame=os.environ.get("ROS2_ODOM_FRAME", "odom"),
                 nav2_navigate_client=nav_goal_client,
             )
+            # Inject into perception/external_pose so world_tick + go_to_world_object
+            # can read pose / dispatch nav2 goals without a direct dependency.
+            from perception.external_pose import set_map_runtime
+            set_map_runtime(map_runtime)
             print("map runtime connected", file=sys.stderr)
             if goal_topic:
                 print(f"Nav2 navigation via {goal_msg_type} topic {goal_topic!r}", file=sys.stderr)

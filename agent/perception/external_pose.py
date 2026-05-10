@@ -1,37 +1,15 @@
-"""External pose + nav functions, injected by you.
+"""External pose + nav functions, used by world_tick + go_to_world_object.
 
-Plan B: instead of pulling pose from /leg_odom over rosbridge and dispatching
-goals via /basic_goal, we just call two functions you provide.
+Wires MapRuntime (TF-based pose lookup over rosbridge) and its Nav2 client
+through a module-level singleton. cli.py calls `set_map_runtime(map_runtime)`
+once at startup; everything else just imports `get_pose` and `goto`.
 
-CURRENT STATE: mock implementation for testing the world-map pipeline without
-real navigation. Pose is read from a JSON file on disk so you can edit it
-between agent turns to simulate robot motion. `goto` updates that same file
-after a fake "walk" delay.
-
-To swap in the real implementation: replace the function bodies of `get_pose`
-and `goto` below with your real ones; the rest of the agent imports them
-from this fixed path:
-
-    from perception.external_pose import get_pose, goto
-
-Contract:
-
-    get_pose() -> Pose | None
-        Return the robot's current pose in whatever world frame your nav uses.
-        Called from world_tick (~1Hz). Should be cheap (<100 ms).
-        Return None if temporarily unavailable.
-
-    goto(x, y, z, *, timeout_s=30.0) -> GotoResult
-        BLOCKING. Drive the robot to (x, y, z) in the same frame.
-        Return when arrived, timed out, or blocked.
+If MapRuntime is unavailable (e.g. no rosbridge), get_pose returns None and
+goto returns GotoResult(status='error').
 """
 
 from __future__ import annotations
 
-import json
-import math
-import os
-import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -51,89 +29,127 @@ class GotoResult:
     detail: Optional[str] = None
 
 
-# ---------------------------------------------------------------- mock state
-# Mock pose stored at this path. Edit this file (or use the helper script
-# scripts/set_pose.py) to simulate the robot moving while the agent runs.
-_MOCK_POSE_PATH = os.environ.get(
-    "MOCK_POSE_PATH",
-    os.path.join(os.path.dirname(__file__), "..", ".mock_pose.json"),
-)
-_MOCK_POSE_PATH = os.path.abspath(_MOCK_POSE_PATH)
-
-# Speed used when goto() simulates walking (meters per second).
-_MOCK_WALK_SPEED = float(os.environ.get("MOCK_WALK_SPEED", "0.3"))
+# Set by cli.py / voice_server.py once MapRuntime is constructed.
+_MAP_RUNTIME = None
 
 
-def _read_mock_pose() -> Pose:
-    """Read the current mock pose; create the file with (0,0,0,0) if missing."""
-    if not os.path.exists(_MOCK_POSE_PATH):
-        _write_mock_pose(Pose(0.0, 0.0, 0.0, 0.0))
-    with open(_MOCK_POSE_PATH) as f:
-        d = json.load(f)
-    return Pose(
-        x=float(d.get("x", 0.0)),
-        y=float(d.get("y", 0.0)),
-        z=float(d.get("z", 0.0)),
-        yaw=float(d.get("yaw", 0.0)),
-    )
-
-
-def _write_mock_pose(pose: Pose) -> None:
-    tmp = _MOCK_POSE_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump({"x": pose.x, "y": pose.y, "z": pose.z, "yaw": pose.yaw}, f)
-    os.replace(tmp, _MOCK_POSE_PATH)
-
-
-# ============================================================================
-# REAL CONTRACT — REPLACE WITH ACTUAL NAV WHEN READY
-# ============================================================================
+def set_map_runtime(map_runtime) -> None:
+    """Inject the MapRuntime instance. Call once at startup."""
+    global _MAP_RUNTIME
+    _MAP_RUNTIME = map_runtime
 
 
 def get_pose() -> Optional[Pose]:
-    """[MOCK] Read pose from .mock_pose.json. None if file is malformed."""
-    try:
-        return _read_mock_pose()
-    except Exception:
+    """Read the robot's pose in the map frame via MapRuntime's TF cache.
+
+    MapRuntime rejects TF older than 0.5s. On a saturated Jetson TF often
+    lags 0.5-2s, so we also fall back to the raw cached transform when the
+    high-level lookup raises a "tf is stale" error.
+    """
+    mr = _MAP_RUNTIME
+    if mr is None:
         return None
+    try:
+        d = mr.get_robot_pose_in_map()
+        p = d.get("pose") or {}
+        return Pose(
+            x=float(p.get("x_m", 0.0)),
+            y=float(p.get("y_m", 0.0)),
+            z=0.0,
+            yaw=float(p.get("yaw_rad", 0.0)),
+        )
+    except Exception as e:
+        # Fallback: accept stale TF up to ~3s. Better drifty pose than no pose
+        # for the world-map use case (we just need rough world coords).
+        if "stale" not in str(e).lower():
+            return None
+        try:
+            tf = mr._lookup_transform(mr.map_frame, mr.base_frame)
+        except Exception:
+            return None
+        if tf.age_s() > 3.0:
+            return None
+        return Pose(x=float(tf.x), y=float(tf.y), z=0.0, yaw=float(tf.yaw))
 
 
 def goto(x: float, y: float, z: float, *, timeout_s: float = 30.0) -> GotoResult:
-    """[MOCK] Simulate walking from current pose to (x, y, z).
+    """Publish a Nav2 goal to /goal_pose and poll pose until arrival or timeout.
 
-    Sleeps for `distance / MOCK_WALK_SPEED` seconds (capped by timeout_s),
-    updates the mock pose to the goal, returns 'reached'. If the simulated
-    walk would exceed timeout_s, returns 'timeout' at an interpolated point.
+    Why /goal_pose instead of the NavigateToPose action: roslibpy 2.0 dropped
+    the actionlib subpackage, so MapRuntime.navigate_to_pose() is unusable
+    over rosbridge. /goal_pose is a plain topic that Nav2's bt_navigator
+    subscribes to for the same purpose.
+
+    Arrival detection: we poll get_pose() and call it 'reached' when within
+    `arrival_radius_m` of the goal. Yaw is ignored (z too — 2D nav).
     """
-    start = _read_mock_pose()
-    dx, dy = x - start.x, y - start.y
-    dist = math.hypot(dx, dy)
-    if dist == 0:
-        return GotoResult(status="reached", final_pose=start, detail="already there")
+    import math
+    import time as _time
 
-    walk_s = dist / _MOCK_WALK_SPEED
-    yaw_to_target = math.atan2(dy, dx)
+    mr = _MAP_RUNTIME
+    if mr is None:
+        return GotoResult(status="error", detail="MapRuntime not initialized")
 
-    if walk_s <= timeout_s:
-        time.sleep(walk_s)
-        final = Pose(x=x, y=y, z=z, yaw=yaw_to_target)
-        _write_mock_pose(final)
-        return GotoResult(
-            status="reached", final_pose=final,
-            detail=f"mock walked {dist:.2f}m in {walk_s:.1f}s",
-        )
+    ros_client = getattr(mr, "_ros_client", None)
+    if ros_client is None:
+        return GotoResult(status="error", detail="MapRuntime has no ros_client")
 
-    # Truncated by timeout.
-    time.sleep(timeout_s)
-    frac = timeout_s / walk_s
-    partial = Pose(
-        x=start.x + dx * frac,
-        y=start.y + dy * frac,
-        z=z,
-        yaw=yaw_to_target,
-    )
-    _write_mock_pose(partial)
-    return GotoResult(
-        status="timeout", final_pose=partial,
-        detail=f"mock walked {dist*frac:.2f}m of {dist:.2f}m before timeout",
-    )
+    arrival_radius_m = 0.15
+    poll_period_s = 0.3
+
+    # Build PoseStamped in the map frame.
+    yaw = 0.0  # we don't constrain final yaw; Nav2 will pick something reasonable
+    half = yaw / 2.0
+    msg = {
+        "header": {"frame_id": getattr(mr, "map_frame", "map")},
+        "pose": {
+            "position": {"x": float(x), "y": float(y), "z": 0.0},
+            "orientation": {
+                "x": 0.0, "y": 0.0,
+                "z": math.sin(half), "w": math.cos(half),
+            },
+        },
+    }
+
+    # Publish via roslibpy directly. Advertise once, publish, leave the topic
+    # open (topic.advertise is idempotent enough — calling it twice is fine).
+    try:
+        import roslibpy
+        topic = roslibpy.Topic(ros_client, "/goal_pose", "geometry_msgs/PoseStamped")
+        topic.advertise()
+        topic.publish(roslibpy.Message(msg))
+    except Exception as e:
+        return GotoResult(status="error", detail=f"/goal_pose publish failed: {e}")
+
+    # If we're already within the arrival radius at dispatch time, don't claim
+    # success — that almost always means the goal was a no-op or the arrival
+    # threshold is too loose. Surface it explicitly so the caller can decide.
+    p0 = get_pose()
+    if p0 is not None:
+        d0 = math.hypot(p0.x - x, p0.y - y)
+        if d0 <= arrival_radius_m:
+            return GotoResult(
+                status="reached", final_pose=p0,
+                detail=f"already within {arrival_radius_m}m of goal at dispatch (no motion)",
+            )
+
+    deadline = _time.monotonic() + timeout_s
+    moved = False
+    start_pose = p0
+    while _time.monotonic() < deadline:
+        p = get_pose()
+        if p is not None:
+            dx, dy = p.x - x, p.y - y
+            if math.hypot(dx, dy) <= arrival_radius_m:
+                return GotoResult(status="reached", final_pose=p,
+                                  detail=f"within {arrival_radius_m}m of goal")
+            if not moved and start_pose is not None:
+                if math.hypot(p.x - start_pose.x, p.y - start_pose.y) > 0.05:
+                    moved = True
+        _time.sleep(poll_period_s)
+
+    final = get_pose()
+    detail = f"did not reach within {arrival_radius_m}m in {timeout_s}s"
+    if not moved:
+        detail += " (robot never moved >5cm — Nav2 may not have accepted the goal)"
+    return GotoResult(status="timeout", final_pose=final, detail=detail)

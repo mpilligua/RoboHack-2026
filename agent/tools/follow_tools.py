@@ -276,7 +276,7 @@ def _sweep_until_found(ctx: ToolContext, label: str, args: dict) -> tuple:
 
     found = found_holder[0]
     if found is None:
-        print(f"[sweep] swept ~{actual_swept_deg:.0f}° in {elapsed:.1f}s "
+        print(f"[sweep] swept ~{actual_swept_deg:.0f}° in {elapsed_s:.1f}s "
               f"with {polls_holder[0]} polls — no match",
               file=sys.stderr, flush=True)
     return found, actual_swept_deg, polls_holder[0], direction, None

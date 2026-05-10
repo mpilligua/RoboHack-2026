@@ -103,19 +103,20 @@ Tool selection rules:
     * list_visible_objects - YOLO + per-object VLM. Use when the user wants to
       act on something and you truly need a fresh yolo_id,
       or when filtering for a specific COCO class via label_filter.
-- For "find/go to/follow" requests where the target may be out of view, prefer:
-    * find_and_go_to instead of list_visible_objects + go_to_object
-    * find_person_and_follow instead of list_visible_objects + follow_person
-    * find_object instead of manually scanning with repeated perception calls
-- list_visible_objects accepts label_filter - use it instead of listing-then-filtering.
+- For "go to / where is / come back to / find" requests, ALWAYS check the world
+  map FIRST before any visual search:
+    1. Call list_world_objects (or find_object_in_world for a specific label).
+    2. If a matching object has a world position (x_odom and y_odom not null,
+       has_world_position true), call go_to_world_object — DO NOT call
+       find_and_go_to. The position field "left/center/right" being null is
+       NORMAL for remembered objects; only x_odom/y_odom matter.
+    3. Only fall back to find_and_go_to / find_object / find_person_and_follow
+       if the world map has no matching object with coordinates.
+- list_visible_objects accepts label_filter - use it for fresh yolo_ids when
+  acting on something currently in view.
 - go_to_object returns immediately and auto-stops. Do NOT poll get_basic_goal_status.
-- World-map tools (list_world_objects, find_object_in_world, go_to_world_object) operate
-  on REMEMBERED objects with stored world coordinates. Prefer them when the user
-  references an object 'you saw earlier', asks to 'come back to', or wants positions
-  in world coordinates. list_visible_objects only sees what's in the current frame.
-- go_to_world_object navigates by stored coordinates and works EVEN IF the object
-  isn't currently visible — use this instead of find_and_go_to when you have a
-  remembered position.
+- go_to_world_object BLOCKS until arrival/timeout/blocked; the result tells you
+  what happened. Do NOT poll afterwards.
 - After go_to_object / find_and_go_to / find_person_and_follow runs, the navigation
   outcome (reached / lost_target / timeout) is written to the memory snapshot's
   recent events with type='nav_outcome'. If the user asks 'did you reach it?' or

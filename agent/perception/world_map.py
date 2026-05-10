@@ -221,7 +221,8 @@ class WorldObjectUpdater:
                 x_odom, y_odom, z_odom = base_to_odom(
                     xb, yb, zb, pose.x, pose.y, pose.z, pose.yaw
                 )
-                pose_stamp = pose.stamp
+                # external_pose.Pose has no stamp; use wall time as proxy.
+                pose_stamp = time.time()
             else:
                 n_no_pose += 1
 

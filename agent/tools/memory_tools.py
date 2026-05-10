@@ -7,7 +7,7 @@ from .base import ToolContext, ToolResult
 
 def _serialize_object(o, *, now: float) -> dict:
     """Common JSON shape for find_object / list_world_objects / get_visible_objects."""
-    age_s = round(now - o.last_seen_ts, 2) if o.last_seen_ts else None
+    age_s = round(max(0.0, now - o.last_seen_ts), 2) if o.last_seen_ts else None
     has_world_pos = o.x_odom is not None and o.y_odom is not None
     return {
         "id": o.yolo_id,
@@ -17,6 +17,7 @@ def _serialize_object(o, *, now: float) -> dict:
         "depth_m": o.depth_m,
         "seen_count": o.seen_count,
         "age_s": age_s,
+        "last_seen_s_ago": age_s,  # alias kept for callers that read this name
         # World position in /leg_odom frame (drifts over minutes). None if the
         # background world-tick hasn't yet projected this detection.
         "x_odom": round(o.x_odom, 3) if o.x_odom is not None else None,
@@ -89,15 +90,19 @@ def handle_go_to_world_object(ctx: ToolContext, args: dict) -> ToolResult:
     stop_distance_m = float(args.get("stop_distance_m", 0.8))
     timeout_s = float(args.get("timeout_s", 30.0))
 
-    # Find candidates with a world position, prefer most recently seen.
-    matches = [
-        o for o in ctx.memory.find_objects_by_label(label)
-        if o.x_odom is not None and o.y_odom is not None
-    ]
+    all_matches = ctx.memory.find_objects_by_label(label)
+    matches = [o for o in all_matches if o.x_odom is not None and o.y_odom is not None]
     if not matches:
+        # Diagnostic: surface what we DID find so we can see why filter rejected.
+        seen = [
+            {"id": o.yolo_id, "label": o.label, "x_odom": o.x_odom, "y_odom": o.y_odom,
+             "age_s": round(time.time() - o.last_seen_ts, 1)}
+            for o in all_matches
+        ]
         return ToolResult(
             ok=False, tool="go_to_world_object",
             error=f"no remembered object matching {label!r} with a world position.",
+            result={"label_matches_without_world_pos": seen, "count": len(seen)},
         )
     target = max(matches, key=lambda o: o.last_seen_ts)
     tx, ty = float(target.x_odom), float(target.y_odom)

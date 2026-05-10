@@ -32,34 +32,80 @@ class MemoryStore:
 
     # --- objects ---
 
+    # Same-label detections within this radius (meters) in the world frame
+    # are treated as the same physical object. Prevents YOLO/ByteTrack
+    # ID-cycling from creating duplicate world-map entries for one chair.
+    _MERGE_RADIUS_M = 0.5
+
+    def _find_world_neighbor(self, record: ObjectRecord) -> Optional[ObjectRecord]:
+        """Find an existing same-label record within MERGE_RADIUS_M of `record`."""
+        if record.x_odom is None or record.y_odom is None:
+            return None
+        label_lower = record.label.lower()
+        r2 = self._MERGE_RADIUS_M * self._MERGE_RADIUS_M
+        best = None
+        best_d2 = r2
+        for o in self._objects.values():
+            if o.yolo_id == record.yolo_id:
+                continue
+            if o.x_odom is None or o.y_odom is None:
+                continue
+            if o.label.lower() != label_lower:
+                continue
+            dx = o.x_odom - record.x_odom
+            dy = o.y_odom - record.y_odom
+            d2 = dx * dx + dy * dy
+            if d2 <= best_d2:
+                best_d2 = d2
+                best = o
+        return best
+
+    def _apply_update(self, existing: ObjectRecord, record: ObjectRecord) -> None:
+        existing.label = record.label
+        existing.description = record.description
+        existing.bbox = record.bbox
+        if record.confidence is not None:
+            existing.confidence = record.confidence
+        if record.depth_m is not None:
+            existing.depth_m = record.depth_m
+        if record.position_text is not None:
+            existing.position_text = record.position_text
+        # World-frame fields: EMA-smooth instead of overwriting (cuts depth jitter).
+        if record.x_odom is not None:
+            existing.x_odom = (
+                record.x_odom if existing.x_odom is None
+                else 0.7 * existing.x_odom + 0.3 * record.x_odom
+            )
+        if record.y_odom is not None:
+            existing.y_odom = (
+                record.y_odom if existing.y_odom is None
+                else 0.7 * existing.y_odom + 0.3 * record.y_odom
+            )
+        if record.z_odom is not None:
+            existing.z_odom = (
+                record.z_odom if existing.z_odom is None
+                else 0.7 * existing.z_odom + 0.3 * record.z_odom
+            )
+        if record.pose_stamp is not None:
+            existing.pose_stamp = record.pose_stamp
+        existing.last_seen_ts = record.last_seen_ts
+        existing.seen_count += 1
+
     def upsert_object(self, record: ObjectRecord) -> None:
         with self._lock:
+            # Match by yolo_id first (same tracker session, same object).
             existing = self._objects.get(record.yolo_id)
             if existing is not None:
-                existing.label = record.label
-                existing.description = record.description
-                existing.bbox = record.bbox
-                if record.confidence is not None:
-                    existing.confidence = record.confidence
-                if record.depth_m is not None:
-                    existing.depth_m = record.depth_m
-                if record.position_text is not None:
-                    existing.position_text = record.position_text
-                # World-frame fields populated by perception/world_tick.py.
-                # Only overwrite when the new record has them — partial updates
-                # without depth/pose shouldn't clobber a prior good projection.
-                if record.x_odom is not None:
-                    existing.x_odom = record.x_odom
-                if record.y_odom is not None:
-                    existing.y_odom = record.y_odom
-                if record.z_odom is not None:
-                    existing.z_odom = record.z_odom
-                if record.pose_stamp is not None:
-                    existing.pose_stamp = record.pose_stamp
-                existing.last_seen_ts = record.last_seen_ts
-                existing.seen_count += 1
-            else:
-                self._objects[record.yolo_id] = record
+                self._apply_update(existing, record)
+                return
+            # No yolo_id match — but if this record has world coords, try
+            # position-based dedup to handle ByteTrack ID cycling.
+            neighbor = self._find_world_neighbor(record)
+            if neighbor is not None:
+                self._apply_update(neighbor, record)
+                return
+            # Fresh object.
+            self._objects[record.yolo_id] = record
 
     def get_objects(self) -> list[ObjectRecord]:
         with self._lock:
@@ -159,6 +205,10 @@ class MemoryStore:
                     "depth_m": o.depth_m,
                     "seen_count": o.seen_count,
                     "last_seen_s_ago": round(max(0.0, time.time() - o.last_seen_ts), 2),
+                    # World coordinates (populated by world_tick when pose is available):
+                    "x_odom": round(o.x_odom, 3) if o.x_odom is not None else None,
+                    "y_odom": round(o.y_odom, 3) if o.y_odom is not None else None,
+                    "has_world_position": o.x_odom is not None and o.y_odom is not None,
                 }
                 for o in sorted(self._objects.values(), key=lambda x: x.last_seen_ts, reverse=True)
             ]
