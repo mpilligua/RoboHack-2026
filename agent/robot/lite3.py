@@ -99,8 +99,24 @@ class Lite3Robot:
 
     # ------------------------------------------------------------------ subs
 
-    def _subscribe(self, topic: str, msg_type: str, cb):
-        sub = roslibpy.Topic(self._client, topic, msg_type)
+    def _subscribe(
+        self,
+        topic: str,
+        msg_type: str,
+        cb,
+        throttle_rate: int = 100,
+        queue_length: int = 1,
+    ):
+        # throttle_rate: min ms between messages pushed over the WS.
+        # queue_length=1: rosbridge drops all but the newest message when the
+        # socket is congested, so we always see the latest frame.
+        sub = roslibpy.Topic(
+            self._client,
+            topic,
+            msg_type,
+            throttle_rate=throttle_rate,
+            queue_length=queue_length,
+        )
         sub.subscribe(cb)
         return sub
 
@@ -154,34 +170,81 @@ class Lite3Robot:
             time.sleep(0.05)
         return None
 
-    def get_rgb(self, timeout_s: float = 3.0) -> RGBFrame:
-        frame = self._wait_for("_rgb", timeout_s)
+    def _wait_for_fresh(self, attr: str, timeout_s: float, max_age_s: float):
+        """Block until the cached frame is younger than `max_age_s`.
+
+        Guards against returning a stale frame that was buffered while the
+        WS queue was backed up. A frame captured before this call started
+        is always considered stale regardless of `max_age_s`.
+        """
+        call_start = time.time()
+        deadline = call_start + timeout_s
+        while time.time() < deadline:
+            with self._lock:
+                val = getattr(self, attr)
+            if val is not None:
+                age = time.time() - val.stamp
+                if age <= max_age_s and val.stamp >= call_start - max_age_s:
+                    return val
+            time.sleep(0.05)
+        return None
+
+    def get_rgb(self, timeout_s: float = 3.0, max_age_s: Optional[float] = None) -> RGBFrame:
+        if max_age_s is None:
+            frame = self._wait_for("_rgb", timeout_s)
+        else:
+            frame = self._wait_for_fresh("_rgb", timeout_s, max_age_s)
         if frame is None:
-            raise TimeoutError(f"No RGB frame on {RGB_TOPIC} within {timeout_s}s")
+            raise TimeoutError(
+                f"No RGB frame on {RGB_TOPIC} within {timeout_s}s"
+                + (f" (max_age_s={max_age_s})" if max_age_s is not None else "")
+            )
         return frame
 
-    def get_depth(self, timeout_s: float = 3.0) -> DepthFrame:
-        frame = self._wait_for("_depth", timeout_s)
+    def get_depth(self, timeout_s: float = 3.0, max_age_s: Optional[float] = None) -> DepthFrame:
+        if max_age_s is None:
+            frame = self._wait_for("_depth", timeout_s)
+        else:
+            frame = self._wait_for_fresh("_depth", timeout_s, max_age_s)
         if frame is None:
-            raise TimeoutError(f"No depth frame on {DEPTH_TOPIC} within {timeout_s}s")
+            raise TimeoutError(
+                f"No depth frame on {DEPTH_TOPIC} within {timeout_s}s"
+                + (f" (max_age_s={max_age_s})" if max_age_s is not None else "")
+            )
         return frame
 
-    def get_rgbd(self, timeout_s: float = 3.0) -> tuple[RGBFrame, DepthFrame]:
-        return self.get_rgb(timeout_s), self.get_depth(timeout_s)
+    def get_rgbd(
+        self,
+        timeout_s: float = 3.0,
+        max_age_s: Optional[float] = None,
+    ) -> tuple[RGBFrame, DepthFrame]:
+        return (
+            self.get_rgb(timeout_s, max_age_s),
+            self.get_depth(timeout_s, max_age_s),
+        )
 
     def get_pose(self, timeout_s: float = 2.0) -> Optional[Pose]:
         return self._wait_for("_pose", timeout_s)
 
-    def rgb_jpeg_b64(self, quality: int = 85, timeout_s: float = 3.0) -> str:
+    def rgb_jpeg_b64(
+        self,
+        quality: int = 85,
+        timeout_s: float = 3.0,
+        max_age_s: Optional[float] = None,
+    ) -> str:
         """RGB frame encoded as base64 JPEG — feed straight to a VLM."""
-        frame = self.get_rgb(timeout_s)
+        frame = self.get_rgb(timeout_s, max_age_s)
         buf = io.BytesIO()
         frame.image.save(buf, format="JPEG", quality=quality)
         return base64.b64encode(buf.getvalue()).decode("ascii")
 
-    def depth_summary(self, timeout_s: float = 3.0) -> dict:
+    def depth_summary(
+        self,
+        timeout_s: float = 3.0,
+        max_age_s: Optional[float] = None,
+    ) -> dict:
         """Compact depth stats — closest object, center distance, etc."""
-        frame = self.get_depth(timeout_s)
+        frame = self.get_depth(timeout_s, max_age_s)
         d = frame.depth_mm
         valid = d[(d > 0) & (d < 10_000)]
         cx, cy = frame.width // 2, frame.height // 2
