@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-import re
+import queue
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator
@@ -43,18 +43,10 @@ _READ_ONLY_TOOLS = frozenset({
 })
 
 _TOOL_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tool")
-_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|\n+")
 
 
 def _can_parallelize(tool_names: list[str]) -> bool:
     return len(tool_names) >= 2 and all(name in _READ_ONLY_TOOLS for name in tool_names)
-
-
-def _sentence_chunks(buf: str) -> tuple[list[str], str]:
-    parts = _SENTENCE_SPLIT.split(buf)
-    if len(parts) == 1:
-        return [], buf
-    return [part for part in parts[:-1] if part.strip()], parts[-1]
 
 
 DIALOGUE_SYSTEM = """\
@@ -66,8 +58,13 @@ Return ONLY a JSON object with two fields:
 No extra text, no markdown, no explanation."""
 
 
-PLANNER_SYSTEM = """\
+def _user_name() -> str:
+    return (os.environ.get("USER_NAME") or "Maria").strip() or "Maria"
+
+
+PLANNER_SYSTEM_TEMPLATE = """\
 You are the planning layer of a quadruped guide-dog robot assistant.
+The user's name is {user_name}. Address them by name when greeting or getting their attention; otherwise no need to repeat it.
 You receive a goal and a memory snapshot, then call tools to fulfill it.
 
 Planning style:
@@ -125,14 +122,37 @@ Tool selection rules:
   AND list_visible_objects for an unusual question that needs both), emit them as multiple
   tool_use blocks in the SAME response. They will run in parallel. Do NOT batch motion
   tools or any tool that changes robot state.
-- Final message to the user is spoken or shown verbatim — keep it minimal:
-    * Default to one short sentence; use two only for a necessary error or safety caveat.
-    * No markdown, bullets, numbered lists, pleasantries, or "I'll..." preamble.
-    * Do not restate the user's request or summarize internal steps.
-- If a tool returns ok=false, give only the essential reason in as few words as safe.
-- Ask a follow-up only when the goal is genuinely ambiguous and the cheapest safe tool path cannot disambiguate it; one short question only.
-- After success, one terse confirmation or outcome — not a recap.
-- Do NOT describe tool calls, reasoning, or planning details to the user."""
+- USER COMMUNICATION — read this carefully:
+    * The user is VISUALLY IMPAIRED and only hears you via the `speak_to_user` tool.
+    * Your assistant text output is an INTERNAL LOG — the user will NOT see or hear it.
+    * To say ANYTHING to the user (confirmations, errors, answers, questions), you MUST call `speak_to_user`.
+    * VOICE & PERSONA: speak like a friendly, calm guide-dog companion. Casual, warm, first-person. NOT like a status report or robot.
+        - Talk like a person, not a robot. "Found a door, heading there now." NOT "I found a door after rotating 35° to the left. The robot is now facing it."
+        - Use "I" / "we", contractions ("I'm", "let's", "got it"). Refer to yourself in first person — never "the robot".
+        - Avoid technical jargon: no degrees, IDs, sensor names, percentages, or status verbs like "successfully", "engaged", "executing". Distances in meters ARE fine when the user is being guided to something — "two meters ahead", "about a meter to your right" — but say it the way a person would, not "2.0 m" or "x_odom 1.83".
+        - Never say "Waiting for your next instruction" or any sign-off — silence is the sign-off.
+        - Examples of GOOD voice: "Got it.", "Found the door, about two meters ahead.", "Walking over now.", "Almost there.", "Reached the chair.", "There's a chair to your right.", "Hmm, I can't see one — want me to look around?", "I'm here.", "Stopped."
+        - Examples of GOOD navigation flow: "Looking for the door." → "Found it, just a couple of meters ahead." → "Walking over." → "I'm here."
+        - Examples of BAD voice: "Action complete.", "I have successfully located the target.", "Rotating 35 degrees.", "The robot is now facing the door.", "Goal status: reached.", "Approaching object yolo_id 42."
+    * GREETINGS: when the user just says "hi", "hello", "hey", or similar, reply with ONLY a warm "Hi {user_name}." or "Hey {user_name}." — no self-introduction, no role explanation, no "I am your guide dog", no offers of help. Just the greeting. Do not call any other tool.
+    * Each `speak_to_user` call: one short sentence, under 15 words for actions/confirmations/errors/questions; up to ~25 words for scene descriptions. Plain spoken English. No markdown, IDs, coordinates, symbols, or units.
+    * You may call `speak_to_user` mid-task for short progress updates ("Looking around.", "Found it, walking over.") — spoken immediately.
+    * NAVIGATION & FIND ACTIONS — give the user real guidance, not just start/end pings. For find_and_go_to, go_to_object, go_to_world_object, go_to_map_pose, go_to_waypoint, follow_person, walk_forward, and similar:
+        1. Acknowledge briefly when you start ("Looking for the door.").
+        2. When you spot or know the target, share what you found and roughly where: "Found it, about two meters ahead." or "It's just to your right, a couple of steps away." Use the distance from the tool result if available (round to natural numbers — "about a meter", "a couple of meters", "right in front of you" for under a meter).
+        3. Confirm arrival: "I'm here." or "Reached the chair." If close but stopped short for safety, say so: "Stopped just short of it."
+        4. Skip the middle if the action is fast (under ~2 seconds) — just start + end.
+    * Do NOT narrate every tool call. Speak only when the user benefits: starting a long action, key milestones during it, finishing one, an error, or an answer.
+    * After success: one terse, casual confirmation ("Done.", "Got it.", "I'm at the chair.").
+    * On tool failure (ok=false): one short, plain-language reason, 5-10 words. Not "Error:" — say what went wrong like a person would.
+    * Ambiguous request: one short speak_to_user question, under 10 words.
+    * Scene description: 2-3 most relevant items in natural phrasing. Spatial cues ("on your left", "ahead", "a couple of meters out") are welcome when they help the user form a picture; skip compass headings and exact coordinates.
+    * If you have nothing useful to say, do not call speak_to_user. Do not announce that you are waiting or done waiting.
+- Your final assistant text may be empty, or a brief internal log of what you did. It is not user-facing."""
+
+
+def _planner_system() -> str:
+    return PLANNER_SYSTEM_TEMPLATE.format(user_name=_user_name())
 
 
 def _bedrock_model() -> str:
@@ -190,110 +210,143 @@ class PlannerAgent:
         from vlm import make_client
 
         bedrock = make_client()
-        system_text = PLANNER_SYSTEM + "\n\nCurrent robot memory:\n" + json.dumps(memory_snapshot, indent=2)
+        system_text = _planner_system() + "\n\nCurrent robot memory:\n" + json.dumps(memory_snapshot, indent=2)
         system = [{"text": system_text}]
         messages: list[dict] = [{"role": "user", "content": [{"text": goal}]}]
         tool_config = {"tools": PLANNER_TOOLS_BEDROCK}
 
-        for _ in range(self._max_steps):
-            resp = bedrock.converse(
-                modelId=_bedrock_model(),
-                system=system,
-                messages=messages,
-                toolConfig=tool_config,
-                inferenceConfig={"maxTokens": 1024},
-            )
-            out_msg = resp["output"]["message"]
-            messages.append(out_msg)
-            stop = resp.get("stopReason")
+        speak_q: queue.Queue[str] = queue.Queue()
+        prev_q = getattr(self._ctx, "speak_queue", None)
+        self._ctx.speak_queue = speak_q
+        spoken: list[str] = []
 
-            if stop != "tool_use":
-                return "".join(part.get("text", "") for part in out_msg["content"] if "text" in part)
+        def collect_speech() -> None:
+            while True:
+                try:
+                    spoken.append(speak_q.get_nowait())
+                except queue.Empty:
+                    return
 
-            tool_uses = [part["toolUse"] for part in out_msg["content"] if "toolUse" in part]
-            tool_results = self._dispatch_tool_uses(tool_uses)
-            messages.append({"role": "user", "content": tool_results})
+        try:
+            for _ in range(self._max_steps):
+                resp = bedrock.converse(
+                    modelId=_bedrock_model(),
+                    system=system,
+                    messages=messages,
+                    toolConfig=tool_config,
+                    inferenceConfig={"maxTokens": 256},
+                )
+                out_msg = resp["output"]["message"]
+                messages.append(out_msg)
+                stop = resp.get("stopReason")
 
-        return "(agent: reached max steps)"
+                internal_text = "".join(part.get("text", "") for part in out_msg["content"] if "text" in part).strip()
+                if internal_text:
+                    print(f"  [planner:internal] {internal_text}", file=sys.stderr)
+
+                if stop != "tool_use":
+                    collect_speech()
+                    return " ".join(spoken)
+
+                tool_uses = [part["toolUse"] for part in out_msg["content"] if "toolUse" in part]
+                tool_results = self._dispatch_tool_uses(tool_uses)
+                messages.append({"role": "user", "content": tool_results})
+                collect_speech()
+
+            collect_speech()
+            return " ".join(spoken) if spoken else "(agent: reached max steps)"
+        finally:
+            self._ctx.speak_queue = prev_q
 
     def _run_boto3_stream(self, goal: str, memory_snapshot: dict) -> Iterator[str]:
         from vlm import make_client
 
         bedrock = make_client()
-        system_text = PLANNER_SYSTEM + "\n\nCurrent robot memory:\n" + json.dumps(memory_snapshot, indent=2)
+        system_text = _planner_system() + "\n\nCurrent robot memory:\n" + json.dumps(memory_snapshot, indent=2)
         system = [{"text": system_text}]
         messages: list[dict] = [{"role": "user", "content": [{"text": goal}]}]
         tool_config = {"tools": PLANNER_TOOLS_BEDROCK}
 
-        for _ in range(self._max_steps):
-            resp = bedrock.converse_stream(
-                modelId=_bedrock_model(),
-                system=system,
-                messages=messages,
-                toolConfig=tool_config,
-                inferenceConfig={"maxTokens": 1024},
-            )
+        speak_q: queue.Queue[str] = queue.Queue()
+        prev_q = getattr(self._ctx, "speak_queue", None)
+        self._ctx.speak_queue = speak_q
 
-            assembled_content: list[dict] = []
-            current_text = ""
-            current_tool: dict | None = None
-            current_tool_input = ""
-            stop_reason = None
-            text_buffer = ""
+        def drain_speak() -> Iterator[str]:
+            while True:
+                try:
+                    yield speak_q.get_nowait()
+                except queue.Empty:
+                    return
 
-            for event in resp["stream"]:
-                if "contentBlockStart" in event:
-                    start = event["contentBlockStart"].get("start", {})
-                    if "toolUse" in start:
-                        current_tool = {
-                            "toolUseId": start["toolUse"]["toolUseId"],
-                            "name": start["toolUse"]["name"],
-                        }
-                        current_tool_input = ""
-                elif "contentBlockDelta" in event:
-                    delta = event["contentBlockDelta"]["delta"]
-                    if "text" in delta:
-                        current_text += delta["text"]
-                        text_buffer += delta["text"]
-                        chunks, text_buffer = _sentence_chunks(text_buffer)
-                        for chunk in chunks:
-                            yield chunk
-                    elif "toolUse" in delta:
-                        current_tool_input += delta["toolUse"].get("input", "")
-                elif "contentBlockStop" in event:
-                    if current_tool is not None:
-                        try:
-                            parsed_input = json.loads(current_tool_input or "{}")
-                        except json.JSONDecodeError:
-                            parsed_input = {}
-                        assembled_content.append({
-                            "toolUse": {
-                                "toolUseId": current_tool["toolUseId"],
-                                "name": current_tool["name"],
-                                "input": parsed_input,
+        try:
+            for _ in range(self._max_steps):
+                resp = bedrock.converse_stream(
+                    modelId=_bedrock_model(),
+                    system=system,
+                    messages=messages,
+                    toolConfig=tool_config,
+                    inferenceConfig={"maxTokens": 256},
+                )
+
+                assembled_content: list[dict] = []
+                current_text = ""
+                current_tool: dict | None = None
+                current_tool_input = ""
+                stop_reason = None
+
+                for event in resp["stream"]:
+                    if "contentBlockStart" in event:
+                        start = event["contentBlockStart"].get("start", {})
+                        if "toolUse" in start:
+                            current_tool = {
+                                "toolUseId": start["toolUse"]["toolUseId"],
+                                "name": start["toolUse"]["name"],
                             }
-                        })
-                        current_tool = None
-                        current_tool_input = ""
-                    elif current_text:
-                        assembled_content.append({"text": current_text})
-                        current_text = ""
-                elif "messageStop" in event:
-                    stop_reason = event["messageStop"].get("stopReason")
+                            current_tool_input = ""
+                    elif "contentBlockDelta" in event:
+                        delta = event["contentBlockDelta"]["delta"]
+                        if "text" in delta:
+                            current_text += delta["text"]
+                        elif "toolUse" in delta:
+                            current_tool_input += delta["toolUse"].get("input", "")
+                    elif "contentBlockStop" in event:
+                        if current_tool is not None:
+                            try:
+                                parsed_input = json.loads(current_tool_input or "{}")
+                            except json.JSONDecodeError:
+                                parsed_input = {}
+                            assembled_content.append({
+                                "toolUse": {
+                                    "toolUseId": current_tool["toolUseId"],
+                                    "name": current_tool["name"],
+                                    "input": parsed_input,
+                                }
+                            })
+                            current_tool = None
+                            current_tool_input = ""
+                        elif current_text:
+                            assembled_content.append({"text": current_text})
+                            if current_text.strip():
+                                print(f"  [planner:internal] {current_text.strip()}", file=sys.stderr)
+                            current_text = ""
+                    elif "messageStop" in event:
+                        stop_reason = event["messageStop"].get("stopReason")
 
-            if text_buffer.strip():
-                yield text_buffer
+                messages.append({"role": "assistant", "content": assembled_content})
 
-            messages.append({"role": "assistant", "content": assembled_content})
+                if stop_reason != "tool_use":
+                    yield from drain_speak()
+                    return
 
-            if stop_reason != "tool_use":
-                return
+                tool_uses = [part["toolUse"] for part in assembled_content if "toolUse" in part]
+                tool_results = self._dispatch_tool_uses(tool_uses)
+                messages.append({"role": "user", "content": tool_results})
 
-            tool_uses = [part["toolUse"] for part in assembled_content if "toolUse" in part]
-            tool_results = self._dispatch_tool_uses(tool_uses)
-            messages.append({"role": "user", "content": tool_results})
+                yield from drain_speak()
 
-        yield "(agent: reached max steps)"
+            yield from drain_speak()
+        finally:
+            self._ctx.speak_queue = prev_q
 
     def _dispatch_tool_uses(self, tool_uses: list[dict]) -> list[dict]:
         names = [tool_use["name"] for tool_use in tool_uses]

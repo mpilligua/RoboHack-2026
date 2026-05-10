@@ -37,3 +37,4 @@ class ToolContext:
     safety: Any    # SafetySupervisor
     map_runtime: Any = None
     waypoints: Any = None
+    speak_queue: Any = None  # queue.Queue[str] | None — set by streaming runner; speak_to_user pushes here

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from .registry import CALLER_OPERATOR, CALLER_PLANNER, ToolRegistry
-from . import basic_goal_tools, follow_tools, map_tools, memory_tools, motion_tools, perception_tools, safety_tools
+from . import basic_goal_tools, follow_tools, map_tools, memory_tools, motion_tools, perception_tools, safety_tools, voice_tools
 
 
 def build_registry() -> ToolRegistry:
     reg = ToolRegistry()
+
+    # Voice tool — only path for the planner to speak to the end user.
+    reg.register("speak_to_user", voice_tools.handle_speak_to_user, [CALLER_PLANNER])
 
     # Safety tools
     reg.register("stop", safety_tools.handle_stop, [CALLER_PLANNER, CALLER_OPERATOR])

@@ -160,6 +160,21 @@ class FakeRegistry:
     def call(self, name: str, args: dict, ctx: ToolContext, caller: str) -> ToolResult:
         if name not in self._names:
             return ToolResult(ok=False, tool=name, error=f"unknown tool: {name!r}")
+        # speak_to_user has real local behavior (push to ctx.speak_queue) we want
+        # to exercise during dry-run; route it through the real handler.
+        if name == "speak_to_user":
+            from tools.voice_tools import handle_speak_to_user
+            t0 = time.time()
+            res = handle_speak_to_user(ctx, args)
+            elapsed_ms = (time.time() - t0) * 1000
+            self.trace.calls.append(CallRecord(
+                step=len(self.trace.calls) + 1,
+                tool=name,
+                args=args,
+                result=res.to_str(),
+                elapsed_ms=elapsed_ms,
+            ))
+            return res
         t0 = time.time()
         result_json = _fabricate_result(
             self._bedrock,
@@ -267,6 +282,53 @@ def run_one(prompt: str, registry_names: list[str]) -> Trace:
     return fake_reg.trace
 
 
+def run_interactive(registry_names: list[str]) -> None:
+    """REPL mode: type prompts, see streamed speak_to_user chunks live.
+
+    Persists MemoryStore + FakeRegistry across turns so the fake scenario stays
+    coherent. Streams via PlannerAgent.run_stream so the speak_queue path is
+    exercised end-to-end (same path the real CLI uses)."""
+    print("[harness] interactive mode — Ctrl-D or 'quit' to exit.")
+    print("[harness] tools are fabricated by Bedrock; no robot needed.")
+    memory = MemoryStore()
+    ctx = _make_dummy_ctx(memory)
+    fake_reg = FakeRegistry(registry_names, scenario_context="interactive session")
+    planner = PlannerAgent(fake_reg, ctx, client=None, max_steps=8)
+
+    while True:
+        try:
+            line = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not line:
+            continue
+        if line.lower() in {"quit", "exit"}:
+            return
+
+        # Update scenario context so fabricator stays grounded in the latest user request.
+        fake_reg.scenario_context = line
+        prior_calls = len(fake_reg.trace.calls)
+
+        snapshot = memory.snapshot()
+        t0 = time.time()
+        spoken_any = False
+        try:
+            for chunk in planner.run_stream(line, snapshot):
+                spoken_any = True
+                print(f"  [speak] {chunk}", flush=True)
+        except Exception as e:
+            print(f"[harness] crashed: {type(e).__name__}: {e}")
+            continue
+        elapsed = time.time() - t0
+
+        new_calls = fake_reg.trace.calls[prior_calls:]
+        seq = " -> ".join(c.tool for c in new_calls) or "(no tools called)"
+        print(f"  [trace] {seq}   ({elapsed:.1f}s)")
+        if not spoken_any:
+            print("  [trace] WARNING: planner produced no speak_to_user output")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -279,11 +341,20 @@ def main() -> None:
         action="append",
         help="Add a custom prompt (repeatable).",
     )
+    parser.add_argument(
+        "--interactive", "-i",
+        action="store_true",
+        help="REPL mode: type prompts, see streamed speak_to_user output live.",
+    )
     args = parser.parse_args()
 
     real_reg = build_registry()
     names = real_reg.names()
     print(f"[harness] {len(names)} tools available: {', '.join(names)}")
+
+    if args.interactive:
+        run_interactive(names)
+        return
 
     prompts = list(DEFAULT_PROMPTS)
     if args.prompt:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import atexit
 import io
 import os
@@ -67,6 +68,7 @@ _robot_state = {
     "map_runtime": None,
     "ros2_client": None,
     "orchestrator": None,
+    "world_tick": None,
     "lock": threading.Lock(),
 }
 
@@ -115,6 +117,8 @@ def _connect_robot():
                 odom_frame=os.environ.get("ROS2_ODOM_FRAME", "odom"),
                 nav2_navigate_client=nav_goal_client,
             )
+            from perception.external_pose import set_map_runtime
+            set_map_runtime(_robot_state["map_runtime"])
             print("[voice] map runtime connected", file=sys.stderr)
             if goal_topic:
                 print(f"[voice] Nav2 via {goal_msg_type} topic {goal_topic!r}", file=sys.stderr)
@@ -153,10 +157,51 @@ def _connect_robot():
         _robot_state["orchestrator"] = Orchestrator(planner, memory)
         _robot_state["safety"] = safety
         print("[voice] bedrock agent ready [native converse + current tools]", file=sys.stderr)
+
+        follow = _robot_state.get("follow")
+        if follow is not None and os.environ.get("DISABLE_WORLD_TICK") != "1":
+            try:
+                from perception.world_tick import WorldTickDriver
+                period = float(os.environ.get("WORLD_TICK_PERIOD_S", "1.0"))
+                world_tick = WorldTickDriver(_robot_state["robot"], follow, memory, period_s=period)
+                world_tick.start()
+                _robot_state["world_tick"] = world_tick
+            except Exception as e:
+                print(f"[voice] world tick failed to start: {e}", file=sys.stderr)
     except Exception as exc:
         print(f"[voice] bedrock agent init failed: {exc}", file=sys.stderr)
         _robot_state["orchestrator"] = None
         _robot_state["safety"] = None
+
+
+def _connect_dry_run() -> None:
+    """Robot-less init: same orchestrator/planner/tools, but FakeRegistry
+    fabricates tool results via Bedrock instead of dispatching to real handlers.
+    Mirrors scripts/dry_run_planner.py's setup."""
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+    from dry_run_planner import FakeRegistry  # noqa: E402
+
+    try:
+        memory = MemoryStore()
+        ctx = ToolContext(
+            memory=memory,
+            robot=None,
+            motion=None,
+            follow=None,
+            basic_goal=None,
+            vlm=None,
+            safety=None,
+        )
+        real_reg = build_registry()
+        fake_reg = FakeRegistry(real_reg.names(), scenario_context="voice session")
+        planner = PlannerAgent(fake_reg, ctx, client=None)
+        _robot_state["orchestrator"] = Orchestrator(planner, memory)
+        _robot_state["safety"] = None
+        _robot_state["fake_reg"] = fake_reg
+        print("[voice] dry-run agent ready [FakeRegistry — no robot]", file=sys.stderr)
+    except Exception as exc:
+        print(f"[voice] dry-run agent init failed: {exc}", file=sys.stderr)
+        _robot_state["orchestrator"] = None
 
 
 def _shutdown_robot() -> None:
@@ -165,12 +210,18 @@ def _shutdown_robot() -> None:
         return
     _robot_state["_shutdown_done"] = True
     print("[voice] shutting down robot connections ...", file=sys.stderr)
+    world_tick = _robot_state.get("world_tick")
     follow = _robot_state.get("follow")
     motion = _robot_state.get("motion")
     basic_goal = _robot_state.get("basic_goal")
     map_runtime = _robot_state.get("map_runtime")
     ros2 = _robot_state.get("ros2_client")
     robot = _robot_state.get("robot")
+    if world_tick is not None:
+        try:
+            world_tick.stop()
+        except Exception:
+            pass
     for adapter in (follow, motion):
         if adapter is None:
             continue
@@ -448,21 +499,12 @@ let replyAudio = null;
 const SILENT_WAV =
   'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
 
-enableBtn.addEventListener('click', async () => {
-  try {
-    replyAudio = new Audio();
-    replyAudio.preload = 'auto';
-    replyAudio.onended = () => setStatus('idle', 'idle');
-    replyAudio.src = SILENT_WAV;
-    await replyAudio.play();
-    enableBtn.hidden = true;
-    ptt.hidden = false;
-    stopBtn.hidden = false;
-    hint.hidden = false;
-    setStatus('ready', 'ok');
-  } catch (err) {
-    setStatus('could not enable audio: ' + (err.message || err.name), 'error');
-  }
+enableBtn.addEventListener('click', () => {
+  enableBtn.hidden = true;
+  ptt.hidden = false;
+  stopBtn.hidden = false;
+  hint.hidden = false;
+  setStatus('ready', 'ok');
 });
 
 stopBtn.addEventListener('click', async () => {
@@ -520,6 +562,15 @@ async function startRecording() {
     setStatus('browser has no audio recording', 'error');
     return;
   }
+  // Re-prime the audio element inside this user gesture so iOS Safari keeps
+  // letting us auto-play the eventual TTS reply.
+  if (replyAudio) {
+    try {
+      replyAudio.src = SILENT_WAV;
+      const p = replyAudio.play();
+      if (p && p.catch) p.catch(() => {});
+    } catch (e) {}
+  }
   try {
     setStatus('asking for mic permission...', 'busy');
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -566,34 +617,43 @@ async function sendAudio(blob, ext) {
   const botDiv = add('bot', data.reply || '(no reply)');
   if (data.tts_id) {
     const url = '/tts?id=' + encodeURIComponent(data.tts_id);
-    setStatus('speaking...', 'busy');
-    if (replyAudio) {
-      replyAudio.src = url;
-      replyAudio.play().catch((err) => {
-        console.warn('autoplay blocked', err);
-        setStatus('autoplay blocked, tap to play', 'error');
-        addPlayButton(botDiv, url);
-      });
-    } else {
-      addPlayButton(botDiv, url);
-      setStatus('idle', 'idle');
-    }
-  } else {
-    setStatus('idle', 'idle');
+    addPlayButton(botDiv, url, true);
   }
+  setStatus('idle', 'idle');
 }
 
-function addPlayButton(parentDiv, url) {
+function addPlayButton(parentDiv, url, tryAutoplay) {
   const btn = document.createElement('button');
-  btn.textContent = 'play reply';
-  btn.style.cssText = 'margin-top:8px;padding:8px 16px;border-radius:10px;background:var(--accent);color:#fff;font-size:14px;';
+  btn.textContent = '▶ tap to hear reply';
+  btn.style.cssText = 'margin-top:10px;padding:14px 20px;border-radius:14px;background:var(--accent);color:#fff;font-size:18px;font-weight:600;width:100%;';
+  let played = false;
   btn.onclick = () => {
+    if (played) return;
+    played = true;
+    btn.textContent = '▶ playing...';
     const a = new Audio(url);
-    a.onended = () => setStatus('idle', 'idle');
+    a.playsInline = true;
+    a.setAttribute('playsinline', '');
+    a.onended = () => { btn.textContent = '✓ played'; setStatus('idle', 'idle'); };
     setStatus('speaking...', 'busy');
-    a.play();
+    a.play().catch((err) => {
+      btn.textContent = '▶ tap to hear reply';
+      played = false;
+      setStatus('tap the button to hear: ' + (err.message || err.name), 'error');
+    });
   };
   parentDiv.appendChild(btn);
+  if (tryAutoplay) {
+    const a = new Audio(url);
+    a.playsInline = true;
+    a.setAttribute('playsinline', '');
+    a.onended = () => { btn.textContent = '✓ played'; setStatus('idle', 'idle'); };
+    setStatus('speaking...', 'busy');
+    a.play().then(() => {
+      played = true;
+      btn.textContent = '▶ playing...';
+    }).catch(() => {});
+  }
 }
 
 ptt.addEventListener('mousedown', startRecording);
@@ -649,6 +709,20 @@ def talk():
         audio.save(file_obj.name)
         wav_path = file_obj.name
     upload_kb = os.path.getsize(wav_path) / 1024
+    print(
+        f"[voice] upload mime={audio.mimetype!r} filename={audio.filename!r} "
+        f"suffix={suffix} size={upload_kb:.1f}KB",
+        file=sys.stderr,
+    )
+    if upload_kb < 2:
+        try:
+            os.unlink(wav_path)
+        except Exception:
+            pass
+        return jsonify({
+            "transcript": "",
+            "reply": "(too short — hold the button for at least half a second)",
+        }), 200
     t_recv = time.time()
     try:
         transcript = whisper_transcribe(wav_path)
@@ -675,6 +749,9 @@ def talk():
             orch = _robot_state.get("orchestrator")
             if orch is None:
                 raise RuntimeError("bedrock agent not initialized")
+            fake_reg = _robot_state.get("fake_reg")
+            if fake_reg is not None:
+                fake_reg.scenario_context = transcript
             for chunk in orch.run_stream(transcript):
                 reply_parts.append(chunk)
                 tts_futures.append(_tts_pool.submit(tts_to_wav, chunk))
@@ -767,8 +844,19 @@ def tts():
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run without a robot: FakeRegistry fabricates tool results via Bedrock.",
+    )
+    args = parser.parse_args()
+
     preload_whisper()
-    _connect_robot()
+    if args.dry_run:
+        _connect_dry_run()
+    else:
+        _connect_robot()
     atexit.register(_shutdown_robot)
 
     def _handle_signal(signum, _frame):

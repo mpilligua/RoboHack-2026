@@ -7,6 +7,21 @@ from tools.registry import CALLER_PLANNER, ToolRegistry
 
 # Neutral tool spec: (name, description, properties, required)
 _SPECS = [
+    (
+        "speak_to_user",
+        "Say something OUT LOUD to the visually impaired end user via text-to-speech. "
+        "This is the ONLY way the user hears you — your final assistant text is internal log "
+        "and is NOT spoken. Keep it to one short sentence (under 15 words), plain spoken "
+        "language, no symbols or IDs. Call this for confirmations, errors, answers, and "
+        "follow-up questions. Do NOT call it to narrate planning or tool calls.",
+        {
+            "text": {
+                "type": "string",
+                "description": "Plain spoken sentence, under 15 words. No markdown, IDs, or coordinates.",
+            },
+        },
+        ["text"],
+    ),
     ("stop", "Stop all robot motion and tracking immediately.", {}, []),
     (
         "get_robot_status",
