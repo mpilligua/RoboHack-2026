@@ -318,6 +318,41 @@ _SPECS = [
         [],
     ),
     ("stop_tracking", "Stop follow/go_to tracking.", {}, []),
+    # World map (persistent, populated by background world-tick thread):
+    (
+        "list_world_objects",
+        "List remembered objects with their world positions (x_odom, y_odom in /leg_odom "
+        "frame). Use this when the user asks 'what objects do you remember', 'where are the "
+        "things you've seen', or before navigating to a remembered object. Unlike "
+        "list_visible_objects, returns objects EVEN IF NOT CURRENTLY IN VIEW, with their "
+        "world coordinates so you can navigate to them.",
+        {"max_age_s": {"type": "number", "description": "Drop entries older than this (seconds)."}},
+        [],
+    ),
+    (
+        "find_object_in_world",
+        "Look up remembered objects matching a label substring. Returns world coordinates "
+        "(x_odom, y_odom) for each match. Faster than find_object: no rotating, just "
+        "memory lookup. Use when the user asks 'where is the chair' and you already have "
+        "the object in memory (check list_world_objects first if unsure).",
+        {"label": {"type": "string", "description": "Label substring, case-insensitive (e.g. 'chair')."}},
+        ["label"],
+    ),
+    (
+        "go_to_world_object",
+        "Walk to a remembered object using its stored world position (no need to see it "
+        "currently). Looks up the most-recently-seen object matching `label` in the world "
+        "map and sends a basic_goal in /leg_odom frame. USE THIS for 'go to the chair you "
+        "saw earlier', 'come back to the table'. Returns ok=false if no remembered match.",
+        {
+            "label": {"type": "string", "description": "Label substring (e.g. 'chair')."},
+            "stop_distance_m": {
+                "type": "number",
+                "description": "Stop short of the object by this much (default 0.8 m).",
+            },
+        },
+        ["label"],
+    ),
 ]
 
 

@@ -183,6 +183,8 @@ def main() -> None:
         except Exception as exc:
             print(f"basic goal adapter failed: {exc}", file=sys.stderr)
 
+    orchestrator = None
+    world_tick = None
     try:
         memory = MemoryStore()
         safety = SafetySupervisor(memory)
@@ -202,6 +204,19 @@ def main() -> None:
         planner = PlannerAgent(registry, ctx, client=None)
         orchestrator = Orchestrator(planner, memory)
         print("bedrock agent ready [native converse + current tools]", file=sys.stderr)
+
+        # Background world-object updater: pulls YOLO detections + RGB + depth
+        # + pose, projects detections into world frame, upserts into MemoryStore
+        # so find_object_in_world / list_world_objects return positions.
+        # Disabled if follow adapter isn't available (no detections to project).
+        if follow is not None and os.environ.get("DISABLE_WORLD_TICK") != "1":
+            try:
+                from perception.world_tick import WorldTickDriver
+                period = float(os.environ.get("WORLD_TICK_PERIOD_S", "1.0"))
+                world_tick = WorldTickDriver(robot, follow, memory, period_s=period)
+                world_tick.start()
+            except Exception as e:
+                print(f"world tick failed to start: {e}", file=sys.stderr)
     except Exception as exc:
         print(f"bedrock agent init failed: {exc}", file=sys.stderr)
         orchestrator = None
@@ -239,6 +254,11 @@ def main() -> None:
                     except Exception:
                         pass
     finally:
+        if world_tick is not None:
+            try:
+                world_tick.stop()
+            except Exception:
+                pass
         if follow is not None:
             try:
                 follow.stop()

@@ -32,7 +32,7 @@ RGB_TOPIC = "/camera/color/image_raw"
 # would need aligned_depth_to_color when available.
 DEPTH_TOPIC = "/camera/depth/image_rect_raw"
 IMU_TOPIC = "/imu/data"
-ODOM_TOPIC = "/leg_odom"
+ODOM_TOPIC = "/leg_odom2"
 JOINT_TOPIC = "/joint_states"
 CMD_VEL_TOPIC = "/cmd_vel"
 
@@ -196,24 +196,6 @@ class Lite3Robot:
                 holder["msg"] = msg
                 evt.set()
 
-    def _subscribe(
-        self,
-        topic: str,
-        msg_type: str,
-        cb,
-        throttle_rate: int = 100,
-        queue_length: int = 1,
-    ):
-        # throttle_rate: min ms between messages pushed over the WS.
-        # queue_length=1: rosbridge drops all but the newest message when the
-        # socket is congested, so we always see the latest frame.
-        sub = roslibpy.Topic(
-            self._client,
-            topic,
-            msg_type,
-            throttle_rate=throttle_rate,
-            queue_length=queue_length,
-        )
         sub.subscribe(cb)
         try:
             if not evt.wait(timeout=timeout_s):
@@ -226,6 +208,28 @@ class Lite3Robot:
                 sub.unsubscribe()
             except Exception:
                 pass
+
+    def _subscribe(
+        self,
+        topic: str,
+        msg_type: str,
+        cb,
+        throttle_rate: int = 100,
+        queue_length: int = 1,
+    ):
+        """Long-lived subscription helper (vs _fetch_one which grabs one)."""
+        # throttle_rate: min ms between messages pushed over the WS.
+        # queue_length=1: rosbridge drops all but the newest message when the
+        # socket is congested, so we always see the latest frame.
+        sub = roslibpy.Topic(
+            self._client,
+            topic,
+            msg_type,
+            throttle_rate=throttle_rate,
+            queue_length=queue_length,
+        )
+        sub.subscribe(cb)
+        return sub
 
     def _fetch_rgb_depth_pair(self, timeout_s: float) -> tuple[dict, dict]:
         """Fetch one RGB and one depth frame on the persistent image WebSocket.
@@ -337,9 +341,18 @@ class Lite3Robot:
         with self._lock:
             return self._pose
 
-    def rgb_jpeg_b64(self, quality: int = 85, timeout_s: float = 12.0) -> str:
-        """RGB frame encoded as base64 JPEG — feed straight to a VLM."""
-        frame = self.get_rgb(timeout_s)
+    def rgb_jpeg_b64(
+        self,
+        quality: int = 85,
+        timeout_s: float = 12.0,
+        max_age_s: Optional[float] = None,
+    ) -> str:
+        """RGB frame encoded as base64 JPEG — feed straight to a VLM.
+
+        ``max_age_s`` is accepted for API compatibility but currently ignored;
+        ``get_rgb`` returns the latest frame anyway.
+        """
+        frame = self.get_rgb(timeout_s=timeout_s)
         buf = io.BytesIO()
         frame.image.save(buf, format="JPEG", quality=quality)
         return base64.b64encode(buf.getvalue()).decode("ascii")
