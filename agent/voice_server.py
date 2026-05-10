@@ -7,13 +7,11 @@ import atexit
 import io
 import os
 import signal
-import subprocess
 import sys
 import tempfile
 import threading
 import time
 import uuid
-import wave
 from concurrent.futures import Future, ThreadPoolExecutor
 
 from dotenv import load_dotenv
@@ -279,53 +277,26 @@ def whisper_transcribe(wav_path: str) -> str:
     return (result.get("text") or "").strip()
 
 
-def tts_to_wav(text: str) -> bytes:
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as file_obj:
-        out = file_obj.name
-    try:
-        subprocess.run(
-            [
-                "say",
-                "-v",
-                TTS_VOICE,
-                "--data-format=LEI16@22050",
-                "--file-format=WAVE",
-                "-o",
-                out,
-                text,
-            ],
-            check=True,
-            capture_output=True,
-            timeout=30,
-        )
-        with open(out, "rb") as file_obj:
-            return file_obj.read()
-    finally:
-        try:
-            os.unlink(out)
-        except Exception:
-            pass
-
+from tts_engine import tts_to_wav, concat_wavs as _concat_wavs  # noqa: E402
 
 _tts_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tts")
 
+# Stage-demo mode: bypass whisper + LLM, return canned scenes from
+# demo_script.SCENES_CONVO. Toggled via `voice_server.py --demo`.
+_DEMO_MODE = False
+_demo_idx = 0
+_demo_lock = threading.Lock()
 
-def _concat_wavs(blobs: list[bytes]) -> bytes:
-    if not blobs:
-        return b""
-    if len(blobs) == 1:
-        return blobs[0]
-    out_buf = io.BytesIO()
-    with wave.open(out_buf, "wb") as w_out:
-        with wave.open(io.BytesIO(blobs[0]), "rb") as w0:
-            w_out.setnchannels(w0.getnchannels())
-            w_out.setsampwidth(w0.getsampwidth())
-            w_out.setframerate(w0.getframerate())
-            w_out.writeframes(w0.readframes(w0.getnframes()))
-        for blob in blobs[1:]:
-            with wave.open(io.BytesIO(blob), "rb") as w_n:
-                w_out.writeframes(w_n.readframes(w_n.getnframes()))
-    return out_buf.getvalue()
+
+def _next_demo_scene() -> tuple[str, str]:
+    """Return (user_transcript, agent_reply) for the next scene; wrap to 0
+    once we run off the end so a demo run can loop without a restart."""
+    from demo_script import SCENES_CONVO
+    global _demo_idx
+    with _demo_lock:
+        idx = _demo_idx % len(SCENES_CONVO)
+        _demo_idx += 1
+    return SCENES_CONVO[idx]
 
 
 _tts_cache: dict[str, bytes] = {}
@@ -567,6 +538,16 @@ function pickRecordMime() {
 }
 
 async function startRecording() {
+  // Demo mode: skip mic entirely. The server ignores audio content and returns
+  // the next scripted scene. We POST a tiny silent blob to satisfy the
+  // multipart upload + the > 2KB size check.
+  if (window.DEMO_MODE) {
+    primeAudio();
+    setStatus('recording...', 'rec');
+    ptt.classList.add('recording');
+    ptt.textContent = 'release to send';
+    return;
+  }
   if (!navigator.mediaDevices) {
     setStatus('browser has no audio recording', 'error');
     return;
@@ -606,6 +587,14 @@ async function startRecording() {
 }
 
 function stopRecording() {
+  if (window.DEMO_MODE) {
+    ptt.classList.remove('recording');
+    ptt.textContent = 'hold to talk';
+    // 4KB of zeros, labeled as audio/webm — satisfies size & MIME checks.
+    const dummy = new Blob([new Uint8Array(4096)], { type: 'audio/webm' });
+    sendAudio(dummy, 'webm');
+    return;
+  }
   if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
   ptt.classList.remove('recording');
   ptt.textContent = 'hold to talk';
@@ -690,7 +679,11 @@ ptt.addEventListener('touchend', (e) => { e.preventDefault(); stopRecording(); }
 
 @app.route("/")
 def index():
-    resp = app.make_response(INDEX_HTML)
+    # Inject a tiny <script> right after <head> so the JS code below can
+    # branch on DEMO_MODE without us having to template the whole page.
+    flag_tag = f"<script>window.DEMO_MODE = {str(bool(_DEMO_MODE)).lower()};</script>"
+    html = INDEX_HTML.replace("<head>", f"<head>\n{flag_tag}", 1)
+    resp = app.make_response(html)
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -724,6 +717,23 @@ def talk():
     audio = request.files.get("audio")
     if audio is None:
         return ("missing audio", 400)
+
+    # --- demo mode: ignore the audio entirely, advance the canned scene list.
+    if _DEMO_MODE:
+        transcript, reply = _next_demo_scene()
+        tts_id = uuid.uuid4().hex
+        try:
+            wav = tts_to_wav(reply)
+            _tts_cache_put(tts_id, wav)
+        except Exception as exc:
+            print(f"[voice/demo] tts failed: {exc}", file=sys.stderr)
+            tts_id = None
+        print(
+            f"[voice/demo] scene -> transcript={transcript[:60]!r} "
+            f"reply={reply[:60]!r} ({time.time()-t_req:.2f}s)",
+            file=sys.stderr,
+        )
+        return jsonify({"transcript": transcript, "reply": reply, "tts_id": tts_id})
 
     suffix = _guess_suffix(audio.mimetype, audio.filename)
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as file_obj:
@@ -844,6 +854,28 @@ def resume():
         return jsonify({"ok": False, "reason": str(exc)}), 500
 
 
+@app.route("/demo/reset", methods=["POST", "GET"])
+def demo_reset():
+    """Rewind the canned scene index to 0 (demo mode only)."""
+    global _demo_idx
+    with _demo_lock:
+        _demo_idx = 0
+    return jsonify({"ok": True, "index": 0, "demo_mode": _DEMO_MODE})
+
+
+@app.route("/demo/state", methods=["GET"])
+def demo_state_route():
+    """Inspect the current scene index (demo mode only)."""
+    from demo_script import SCENES_CONVO
+    with _demo_lock:
+        idx = _demo_idx
+    return jsonify({
+        "demo_mode": _DEMO_MODE,
+        "next_index": idx % len(SCENES_CONVO),
+        "scenes_total": len(SCENES_CONVO),
+    })
+
+
 @app.route("/tts_test")
 def tts_test():
     audio = tts_to_wav("hello, this is a test of the audio path.")
@@ -871,18 +903,31 @@ def main() -> None:
         action="store_true",
         help="Run without a robot: FakeRegistry fabricates tool results via Bedrock.",
     )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Stage-demo mode: ignore mic audio + LLM, return canned scenes from "
+             "demo_script.SCENES_CONVO. Skips whisper preload and robot bring-up.",
+    )
     args = parser.parse_args()
 
-    preload_whisper()
-    if args.dry_run:
-        _connect_dry_run()
+    global _DEMO_MODE
+    _DEMO_MODE = args.demo
+
+    if args.demo:
+        print("[voice] DEMO MODE — whisper + LLM + robot bypassed", file=sys.stderr)
     else:
-        _connect_robot()
-    atexit.register(_shutdown_robot)
+        preload_whisper()
+        if args.dry_run:
+            _connect_dry_run()
+        else:
+            _connect_robot()
+        atexit.register(_shutdown_robot)
 
     def _handle_signal(signum, _frame):
         print(f"[voice] received signal {signum}, shutting down", file=sys.stderr)
-        _shutdown_robot()
+        if not args.demo:
+            _shutdown_robot()
         sys.exit(0)
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -900,7 +945,8 @@ def main() -> None:
     try:
         app.run(host=LISTEN_HOST, port=LISTEN_PORT, threaded=True)
     finally:
-        _shutdown_robot()
+        if not args.demo:
+            _shutdown_robot()
 
 
 if __name__ == "__main__":
