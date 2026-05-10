@@ -281,22 +281,68 @@ from tts_engine import tts_to_wav, concat_wavs as _concat_wavs  # noqa: E402
 
 _tts_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="tts")
 
-# Stage-demo mode: bypass whisper + LLM, return canned scenes from
-# demo_script.SCENES_CONVO. Toggled via `voice_server.py --demo`.
+# Stage-demo mode: bypass whisper + LLM, advance through demo_scenes.SCENES.
+# Toggled via `voice_server.py --demo`. Each phone tap = one full scene
+# (prompt + reply + motion, motion fired on a worker thread).
 _DEMO_MODE = False
+_DEMO_ROBOT = False  # set True if --demo without --no-robot succeeds at connecting
+_DEMO_TOOL_CTX = None  # ToolContext built at server startup (set in main)
+_DEMO_MOTION_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="demo-motion")
 _demo_idx = 0
 _demo_lock = threading.Lock()
 
 
-def _next_demo_scene() -> tuple[str, str]:
-    """Return (user_transcript, agent_reply) for the next scene; wrap to 0
-    once we run off the end so a demo run can loop without a restart."""
-    from demo_script import SCENES_CONVO
+def _build_demo_tool_ctx():
+    """Build a ToolContext + cleanups list for --demo mode (no LLM agent
+    needed; just the robot adapters the scenes call)."""
+    from memory.store import MemoryStore
+    from robot import Lite3BasicGoal, Lite3Follow, Lite3Motion, Lite3Robot, connect_ros2_rosbridge
+    from safety.supervisor import SafetySupervisor
+    from tools.base import ToolContext
+    from vlm_client import make_vlm_client
+
+    cleanups: list = []
+    host = os.environ.get("ROS_BRIDGE_HOST", "192.168.1.103")
+    port = int(os.environ.get("ROS2_BRIDGE_PORT", "9091"))
+
+    print(f"[voice/demo] connecting to ws://{host}:{port} ...", file=sys.stderr)
+    ros2 = connect_ros2_rosbridge(host, port)
+    cleanups.append(lambda: ros2.terminate())
+
+    robot = Lite3Robot(host=host, port=port, ros_client=ros2)
+    cleanups.append(robot.close)
+
+    motion = Lite3Motion(ros_client=ros2)
+    cleanups.append(motion.close)
+    cleanups.append(motion.stop)
+
+    follow = Lite3Follow(ros_client=ros2)
+    cleanups.append(follow.close)
+    cleanups.append(follow.stop)
+
+    basic_goal = Lite3BasicGoal(ros_client=ros2)
+    cleanups.append(basic_goal.close)
+
+    memory = MemoryStore()
+    safety = SafetySupervisor(memory)
+    vlm = make_vlm_client()
+
+    ctx = ToolContext(
+        memory=memory, robot=robot, motion=motion, follow=follow,
+        basic_goal=basic_goal, vlm=vlm, safety=safety,
+    )
+    return ctx, cleanups
+
+
+def _next_demo_scene():
+    """Return the next demo_scenes.Scene; wrap to 0 after the last one so a
+    demo run can loop without restarting the server."""
+    from demo_scenes import SCENES
     global _demo_idx
     with _demo_lock:
-        idx = _demo_idx % len(SCENES_CONVO)
+        idx = _demo_idx % len(SCENES)
         _demo_idx += 1
-    return SCENES_CONVO[idx]
+    return SCENES[idx], idx
 
 
 _tts_cache: dict[str, bytes] = {}
@@ -718,19 +764,49 @@ def talk():
     if audio is None:
         return ("missing audio", 400)
 
-    # --- demo mode: ignore the audio entirely, advance the canned scene list.
+    # --- demo mode: ignore the audio entirely. Advance one scene: synthesize
+    # TTS for the phone, ALSO speak it on the laptop, AND fire the scene's
+    # motion on a worker thread so the HTTP response returns immediately.
     if _DEMO_MODE:
-        transcript, reply = _next_demo_scene()
+        scene, idx = _next_demo_scene()
+        transcript, reply = scene.prompt, scene.reply
         tts_id = uuid.uuid4().hex
         try:
             wav = tts_to_wav(reply)
             _tts_cache_put(tts_id, wav)
         except Exception as exc:
-            print(f"[voice/demo] tts failed: {exc}", file=sys.stderr)
+            print(f"[voice/demo] phone tts failed: {exc}", file=sys.stderr)
             tts_id = None
+
+        # Laptop TTS in parallel with the response. Fire-and-forget on the
+        # tts pool so we don't block the HTTP reply.
+        from tts_engine import speak as _speak_local
+
+        def _laptop_speak() -> None:
+            try:
+                _speak_local(reply)
+            except Exception as exc:
+                print(f"[voice/demo] laptop tts failed: {exc}", file=sys.stderr)
+
+        _tts_pool.submit(_laptop_speak)
+
+        # Motion: only if we actually built a ToolContext at startup AND the
+        # scene defines motion. Run on the dedicated single-worker pool so
+        # presses don't pile up motion calls in parallel.
+        if _DEMO_ROBOT and _DEMO_TOOL_CTX is not None:
+            def _do_motion(scene_=scene):
+                try:
+                    print(f"[voice/demo] motion start: {scene_.name}", file=sys.stderr)
+                    scene_.motion(_DEMO_TOOL_CTX)
+                    print(f"[voice/demo] motion done: {scene_.name}", file=sys.stderr)
+                except Exception as exc:
+                    print(f"[voice/demo] motion failed in {scene_.name}: "
+                          f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            _DEMO_MOTION_POOL.submit(_do_motion)
+
         print(
-            f"[voice/demo] scene -> transcript={transcript[:60]!r} "
-            f"reply={reply[:60]!r} ({time.time()-t_req:.2f}s)",
+            f"[voice/demo] scene {idx+1} '{scene.name}' "
+            f"({time.time()-t_req:.2f}s, robot={'on' if _DEMO_ROBOT else 'off'})",
             file=sys.stderr,
         )
         return jsonify({"transcript": transcript, "reply": reply, "tts_id": tts_id})
@@ -817,9 +893,33 @@ def stop():
     """Hard-stop the robot without going through the LLM.
 
     Wired to the big red button in the UI so a blind user gets an immediate
-    halt — no Whisper, no Bedrock, no tool dispatch in the loop.
+    halt — no Whisper, no Bedrock, no tool dispatch in the loop. Works in
+    both real mode (uses _robot_state) and --demo mode (uses _DEMO_TOOL_CTX).
     """
     errors: list[str] = []
+
+    # --demo mode: stop via the ToolContext we built at startup.
+    if _DEMO_MODE and _DEMO_TOOL_CTX is not None:
+        ctx = _DEMO_TOOL_CTX
+        try:
+            ctx.safety.trigger_emergency_stop()
+        except Exception as exc:
+            errors.append(f"demo.safety: {exc}")
+        for attr in ("follow", "motion", "robot", "basic_goal"):
+            obj = getattr(ctx, attr, None)
+            if obj is None:
+                continue
+            for method in ("stop", "cancel"):
+                fn = getattr(obj, method, None)
+                if fn is None:
+                    continue
+                try:
+                    fn()
+                except Exception as exc:
+                    errors.append(f"demo.{attr}.{method}: {exc}")
+        print(f"[voice/demo] /stop fired (errors: {errors or 'none'})", file=sys.stderr)
+        return jsonify({"ok": not errors, "errors": errors})
+
     safety = _robot_state.get("safety")
     if safety is not None:
         try:
@@ -866,13 +966,16 @@ def demo_reset():
 @app.route("/demo/state", methods=["GET"])
 def demo_state_route():
     """Inspect the current scene index (demo mode only)."""
-    from demo_script import SCENES_CONVO
+    from demo_scenes import SCENES
     with _demo_lock:
         idx = _demo_idx
+    next_i = idx % len(SCENES)
     return jsonify({
         "demo_mode": _DEMO_MODE,
-        "next_index": idx % len(SCENES_CONVO),
-        "scenes_total": len(SCENES_CONVO),
+        "robot_connected": _DEMO_ROBOT,
+        "next_index": next_i,
+        "next_scene": SCENES[next_i].name,
+        "scenes_total": len(SCENES),
     })
 
 
@@ -906,16 +1009,44 @@ def main() -> None:
     parser.add_argument(
         "--demo",
         action="store_true",
-        help="Stage-demo mode: ignore mic audio + LLM, return canned scenes from "
-             "demo_script.SCENES_CONVO. Skips whisper preload and robot bring-up.",
+        help="Stage-demo mode: ignore mic audio + LLM, return canned scenes "
+             "from demo_scenes.SCENES. Skips whisper preload. By default also "
+             "connects to the robot so each phone tap fires real motion.",
+    )
+    parser.add_argument(
+        "--no-robot",
+        action="store_true",
+        help="With --demo: skip the robot connection (rehearsal mode, no motion).",
     )
     args = parser.parse_args()
 
-    global _DEMO_MODE
+    global _DEMO_MODE, _DEMO_ROBOT, _DEMO_TOOL_CTX
     _DEMO_MODE = args.demo
 
     if args.demo:
-        print("[voice] DEMO MODE — whisper + LLM + robot bypassed", file=sys.stderr)
+        if args.no_robot:
+            print("[voice] DEMO MODE — speech only, robot not connected.", file=sys.stderr)
+        else:
+            print("[voice] DEMO MODE — whisper + LLM bypassed; "
+                  "connecting to robot for motion...", file=sys.stderr)
+            try:
+                ctx, cleanups = _build_demo_tool_ctx()
+                _DEMO_TOOL_CTX = ctx
+                _DEMO_ROBOT = True
+                # Tear the robot down on signal/exit just like real mode.
+                def _shutdown_demo():
+                    for fn in reversed(cleanups):
+                        try:
+                            fn()
+                        except Exception:
+                            pass
+                atexit.register(_shutdown_demo)
+                print("[voice] robot connected; phone taps will fire motion.",
+                      file=sys.stderr)
+            except Exception as exc:
+                print(f"[voice] robot connect failed ({type(exc).__name__}: {exc}); "
+                      "continuing in speech-only mode.", file=sys.stderr)
+                _DEMO_ROBOT = False
     else:
         preload_whisper()
         if args.dry_run:

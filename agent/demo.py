@@ -272,20 +272,22 @@ def scene_5_find_a_seat(d: DemoCtx) -> None:
     wait_for_ptt(f"{USER_NAME}: 'I'm done. Find me somewhere to sit.'")
     user_line("I'm done. Find me somewhere to sit.")
     speak("I remember a chair to your left. Let me guide you there.")
-    d.call("plan_path(goal='chair')",
-           lambda: follow_tools.handle_find_object(d.tool_ctx, {"label": "chair"}),
-           goal="chair", remaining_m="3.0")
     demo_state.advance(6)
-    beat(0.3)
+    # find_and_go_to is one blocking call: rotates until the chair is in view,
+    # then drives toward it with depth-based auto-stop. No hardcoded distance,
+    # no second walk_forward needed. The call itself takes a few seconds, so
+    # we narrate before AND after rather than mid-action.
     speak("Walking over now.")
-    d.call("execute_path()",
-           lambda: motion_tools.handle_walk_forward(d.tool_ctx, {"distance_m": 1.5}),
-           remaining_m="1.5")
-    beat(0.3)
-    speak("Almost there, the chair's right in front of you.")
-    d.call("execute_path()",
-           lambda: motion_tools.handle_walk_forward(d.tool_ctx, {"distance_m": 0.5}),
-           remaining_m="0.0")
+    # stop_distance_m is the depth threshold at which the robot halts:
+    # the bbox median depth reaching this value triggers stop. Larger value
+    # = stop SOONER (further from the chair). Default 0.8 m had the robot
+    # touching the chair, so we use 1.2 m to leave roughly a 0.3 m gap once
+    # the seat/armrest depth + low-angle perspective are accounted for.
+    d.call("find_and_go_to(label='chair', stop_distance_m=1.2)",
+           lambda: follow_tools.handle_find_and_go_to(d.tool_ctx, {
+               "label": "chair", "stop_distance_m": 1.2,
+           }),
+           goal="chair", stop_distance_m=1.2)
     beat(0.3)
     speak("We've arrived. The chair is directly in front of you. You can reach forward slowly.")
 
