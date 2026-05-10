@@ -478,15 +478,13 @@ INDEX_HTML = """<!doctype html>
     <div class="sub">hold to speak</div>
   </header>
   <div id="status">idle</div>
-  <button id="enableAudio">tap once to enable audio</button>
-  <button id="ptt" hidden>hold to talk</button>
-  <button id="stopBtn" hidden>STOP</button>
-  <div class="hint" id="hint" hidden>hold the blue button while speaking</div>
+  <button id="ptt">hold to talk</button>
+  <button id="stopBtn">STOP</button>
+  <div class="hint" id="hint">hold the blue button while speaking</div>
   <div class="log" id="log"></div>
 </div>
 <script>
 const ptt = document.getElementById('ptt');
-const enableBtn = document.getElementById('enableAudio');
 const stopBtn = document.getElementById('stopBtn');
 const hint = document.getElementById('hint');
 const log = document.getElementById('log');
@@ -499,13 +497,24 @@ let replyAudio = null;
 const SILENT_WAV =
   'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=';
 
-enableBtn.addEventListener('click', () => {
-  enableBtn.hidden = true;
-  ptt.hidden = false;
-  stopBtn.hidden = false;
-  hint.hidden = false;
-  setStatus('ready', 'ok');
-});
+// On the first PTT press we prime <audio> with a silent clip so iOS/Safari
+// will allow programmatic play() later when the reply audio arrives.
+let audioPrimed = false;
+function primeAudio() {
+  if (audioPrimed) return;
+  audioPrimed = true;
+  try {
+    replyAudio = new Audio();
+    replyAudio.preload = 'auto';
+    replyAudio.playsInline = true;
+    replyAudio.setAttribute('playsinline', '');
+    replyAudio.onended = () => setStatus('idle', 'idle');
+    replyAudio.src = SILENT_WAV;
+    const p = replyAudio.play();
+    if (p && p.catch) p.catch(() => {});
+  } catch (e) {}
+}
+setStatus('ready', 'ok');
 
 stopBtn.addEventListener('click', async () => {
   // Immediately pause speech playback...
@@ -617,9 +626,21 @@ async function sendAudio(blob, ext) {
   const botDiv = add('bot', data.reply || '(no reply)');
   if (data.tts_id) {
     const url = '/tts?id=' + encodeURIComponent(data.tts_id);
-    addPlayButton(botDiv, url, true);
+    setStatus('speaking...', 'busy');
+    if (replyAudio) {
+      replyAudio.src = url;
+      replyAudio.play().catch((err) => {
+        console.warn('autoplay blocked', err);
+        setStatus('autoplay blocked, tap to play', 'error');
+        addPlayButton(botDiv, url, false);
+      });
+    } else {
+      addPlayButton(botDiv, url, false);
+      setStatus('idle', 'idle');
+    }
+  } else {
+    setStatus('idle', 'idle');
   }
-  setStatus('idle', 'idle');
 }
 
 function addPlayButton(parentDiv, url, tryAutoplay) {
@@ -656,10 +677,10 @@ function addPlayButton(parentDiv, url, tryAutoplay) {
   }
 }
 
-ptt.addEventListener('mousedown', startRecording);
+ptt.addEventListener('mousedown', () => { primeAudio(); startRecording(); });
 ptt.addEventListener('mouseup', stopRecording);
 ptt.addEventListener('mouseleave', () => { if (mediaRecorder?.state === 'recording') stopRecording(); });
-ptt.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); }, { passive: false });
+ptt.addEventListener('touchstart', (e) => { e.preventDefault(); primeAudio(); startRecording(); }, { passive: false });
 ptt.addEventListener('touchend', (e) => { e.preventDefault(); stopRecording(); }, { passive: false });
 </script>
 </body>
