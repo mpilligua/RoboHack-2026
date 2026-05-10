@@ -13,7 +13,7 @@ except ImportError:  # pragma: no cover - local unit tests run without ROS deps
     roslibpy = None
 
 
-TF_STALE_S = 0.5
+TF_STALE_S = 2.0
 SCAN_STALE_S = 1.0
 LOCAL_COSTMAP_STALE_S = 2.0
 GLOBAL_COSTMAP_STALE_S = 8.0
@@ -99,6 +99,20 @@ def _distance(x0: float, y0: float, x1: float, y1: float) -> float:
     return math.hypot(x1 - x0, y1 - y0)
 
 
+def _ros_actions_legacy_available() -> bool:
+    """roslibpy 1.x exposes Nav2 actions via ``roslibpy.actionlib``."""
+    return roslibpy is not None and hasattr(roslibpy, "actionlib")
+
+
+def _ros_actions_modern_available() -> bool:
+    """roslibpy 2.x uses :class:`roslibpy.ActionClient` (no ``actionlib`` submodule)."""
+    return roslibpy is not None and hasattr(roslibpy, "ActionClient")
+
+
+def _ros_actions_usable() -> bool:
+    return _ros_actions_legacy_available() or _ros_actions_modern_available()
+
+
 class Nav2PathClient:
     """Best-effort Nav2 planning adapter with optional actionlib support."""
 
@@ -108,62 +122,119 @@ class Nav2PathClient:
         *,
         action_name: str = "/compute_path_to_pose",
         action_type: str = "nav2_msgs/action/ComputePathToPose",
+        pose_frame_id: str = "map",
         injected_compute: Optional[Callable[[dict, dict, float], dict]] = None,
     ) -> None:
         self._ros_client = ros_client
         self._action_name = action_name
         self._action_type = action_type
+        self._pose_frame_id = pose_frame_id or "map"
         self._injected_compute = injected_compute
         self._action_client = None
         self._action_failed = False
+        self._action_api: Optional[str] = None
 
-    def compute_path(self, start_pose: dict, goal_pose: dict, timeout_s: float = 3.0) -> dict:
-        if self._injected_compute is not None:
-            return self._injected_compute(start_pose, goal_pose, timeout_s)
-        if self._action_failed or roslibpy is None or not hasattr(roslibpy, "actionlib"):
-            raise RuntimeError("nav2 action client unavailable over rosbridge")
-        if self._action_client is None:
-            try:
+    def _ensure_nav2_path_action_client(self) -> None:
+        if self._action_client is not None:
+            return
+        try:
+            if _ros_actions_legacy_available():
+                self._action_api = "legacy"
                 self._action_client = roslibpy.actionlib.ActionClient(
                     self._ros_client,
                     self._action_name,
                     self._action_type,
                 )
-            except Exception as exc:
-                self._action_failed = True
-                raise RuntimeError(f"could not initialize nav2 action client: {exc}") from exc
+            elif _ros_actions_modern_available():
+                self._action_api = "modern"
+                self._action_client = roslibpy.ActionClient(
+                    self._ros_client,
+                    self._action_name,
+                    self._action_type,
+                )
+            else:
+                raise RuntimeError("no roslibpy action client implementation available")
+        except Exception as exc:
+            self._action_failed = True
+            raise RuntimeError(f"could not initialize nav2 action client: {exc}") from exc
 
-        done = threading.Event()
-        outcome: dict[str, Any] = {}
+    def compute_path(self, start_pose: dict, goal_pose: dict, timeout_s: float = 3.0) -> dict:
+        if self._injected_compute is not None:
+            return self._injected_compute(start_pose, goal_pose, timeout_s)
+        if self._action_failed or roslibpy is None or not _ros_actions_usable():
+            raise RuntimeError("nav2 action client unavailable over rosbridge")
+        self._ensure_nav2_path_action_client()
+
         goal_msg = {
-            "goal": _pose_stamped(goal_pose),
-            "start": _pose_stamped(start_pose),
+            "goal": _pose_stamped(goal_pose, frame_id=self._pose_frame_id),
+            "start": _pose_stamped(start_pose, frame_id=self._pose_frame_id),
             "planner_id": "",
             "use_start": True,
         }
 
-        def _on_result(result: dict) -> None:
+        done = threading.Event()
+        outcome: dict[str, Any] = {}
+
+        if self._action_api == "legacy":
+            def _on_result(result: dict) -> None:
+                outcome["result"] = result
+                done.set()
+
+            try:
+                goal = roslibpy.actionlib.Goal(self._action_client, roslibpy.Message(goal_msg))
+                goal.send(result_callback=_on_result)
+            except Exception as exc:
+                self._action_failed = True
+                raise RuntimeError(f"nav2 compute_path_to_pose send failed: {exc}") from exc
+
+            if not done.wait(timeout_s):
+                try:
+                    goal.cancel()
+                except Exception:
+                    pass
+                raise RuntimeError("nav2 compute_path_to_pose timed out")
+            return outcome.get("result") or {}
+
+        def _modern_resultback(result: dict) -> None:
             outcome["result"] = result
             done.set()
 
+        def _modern_errback(err: Any) -> None:
+            outcome["error"] = str(err)
+            done.set()
+
         try:
-            goal = roslibpy.actionlib.Goal(self._action_client, roslibpy.Message(goal_msg))
-            goal.send(result_callback=_on_result)
+            goal_id = self._action_client.send_goal(
+                roslibpy.Goal(goal_msg),
+                _modern_resultback,
+                lambda _fb: None,
+                _modern_errback,
+            )
         except Exception as exc:
             self._action_failed = True
             raise RuntimeError(f"nav2 compute_path_to_pose send failed: {exc}") from exc
 
+        if not goal_id:
+            raise RuntimeError("nav2 compute_path_to_pose send failed: action client rejected goal")
+
         if not done.wait(timeout_s):
             try:
-                goal.cancel()
+                self._action_client.cancel_goal(goal_id)
             except Exception:
                 pass
             raise RuntimeError("nav2 compute_path_to_pose timed out")
+        if outcome.get("error"):
+            raise RuntimeError(f"nav2 compute_path_to_pose failed: {outcome['error']}")
         return outcome.get("result") or {}
 
 
 class Nav2NavigateClient:
-    """Best-effort Nav2 navigate_to_pose adapter with lightweight status caching."""
+    """Best-effort Nav2 navigate_to_pose adapter with lightweight status caching.
+
+    When ``goal_pose_topic`` is set, sends ``geometry_msgs/PoseStamped`` via that topic
+    (Nav2 ``bt_navigator`` subscribes on many Foxy stacks). Use this when rosbridge
+    does not implement ``send_action_goal`` (e.g. Foxy apt ``rosbridge_suite`` 1.3.1).
+    """
 
     def __init__(
         self,
@@ -171,23 +242,63 @@ class Nav2NavigateClient:
         *,
         action_name: str = "/navigate_to_pose",
         action_type: str = "nav2_msgs/action/NavigateToPose",
+        goal_pose_topic: Optional[str] = None,
+        goal_message_type: str = "PoseStamped",
+        goal_frame_id: str = "map",
         injected_send: Optional[Callable[[dict, float], dict]] = None,
         injected_cancel: Optional[Callable[[str], dict]] = None,
     ) -> None:
         self._ros_client = ros_client
         self._action_name = action_name
         self._action_type = action_type
+        self._goal_pose_topic = (goal_pose_topic or "").strip() or None
+        self._goal_message_type = goal_message_type or "PoseStamped"
+        self._goal_frame_id = goal_frame_id or "map"
         self._injected_send = injected_send
         self._injected_cancel = injected_cancel
         self._action_client = None
         self._action_failed = False
+        self._action_api: Optional[str] = None
+        self._goal_pub = None
         self._lock = threading.Lock()
-        self._goal = None
+        self._pending_cancel: Optional[Callable[[], None]] = None
         self._status = "idle"
         self._status_ts: Optional[float] = None
         self._last_goal: Optional[dict] = None
         self._last_result: Optional[dict] = None
         self._last_error: Optional[str] = None
+
+    def _ensure_nav2_navigate_action_client(self) -> None:
+        if self._action_client is not None:
+            return
+        try:
+            if _ros_actions_legacy_available():
+                self._action_api = "legacy"
+                self._action_client = roslibpy.actionlib.ActionClient(
+                    self._ros_client,
+                    self._action_name,
+                    self._action_type,
+                )
+            elif _ros_actions_modern_available():
+                self._action_api = "modern"
+                self._action_client = roslibpy.ActionClient(
+                    self._ros_client,
+                    self._action_name,
+                    self._action_type,
+                )
+            else:
+                raise RuntimeError("no roslibpy action client implementation available")
+        except Exception as exc:
+            self._action_failed = True
+            raise RuntimeError(f"could not initialize nav2 navigate client: {exc}") from exc
+
+    def close(self) -> None:
+        if self._goal_pub is not None:
+            try:
+                self._goal_pub.unadvertise()
+            except Exception:
+                pass
+            self._goal_pub = None
 
     def navigate_to_pose(self, goal_pose: dict, timeout_s: float = 3.0) -> dict:
         if self._injected_send is not None:
@@ -199,45 +310,116 @@ class Nav2NavigateClient:
                 self._last_result = dict(result)
                 self._last_error = None
             return result
-        if self._action_failed or roslibpy is None or not hasattr(roslibpy, "actionlib"):
-            raise RuntimeError("nav2 navigate_to_pose action client unavailable over rosbridge")
-        if self._action_client is None:
-            try:
-                self._action_client = roslibpy.actionlib.ActionClient(
+        if self._goal_pose_topic is not None:
+            if roslibpy is None:
+                raise RuntimeError("roslibpy unavailable for goal pose topic publish")
+            
+            # Support both PoseStamped and Pose2D message types
+            if self._goal_message_type == "Pose2D":
+                msg_dict = {
+                    "x": float(goal_pose["x_m"]),
+                    "y": float(goal_pose["y_m"]),
+                    "theta": float(goal_pose.get("yaw_rad", 0.0)),
+                }
+                msg_type_full = "geometry_msgs/Pose2D"
+            else:  # PoseStamped
+                msg_dict = _pose_stamped(goal_pose, frame_id=self._goal_frame_id)
+                msg_type_full = "geometry_msgs/PoseStamped"
+            
+            if self._goal_pub is None:
+                self._goal_pub = roslibpy.Topic(
                     self._ros_client,
-                    self._action_name,
-                    self._action_type,
+                    self._goal_pose_topic,
+                    msg_type_full,
                 )
-            except Exception as exc:
-                self._action_failed = True
-                raise RuntimeError(f"could not initialize nav2 navigate client: {exc}") from exc
+                self._goal_pub.advertise()
+            self._goal_pub.publish(roslibpy.Message(msg_dict))
+            with self._lock:
+                self._pending_cancel = None
+                self._status = "published"
+                self._status_ts = time.time()
+                self._last_goal = dict(goal_pose)
+                self._last_result = {}
+                self._last_error = None
+            return self.get_status()
+        if self._action_failed or roslibpy is None or not _ros_actions_usable():
+            raise RuntimeError("nav2 navigate_to_pose action client unavailable over rosbridge")
+        self._ensure_nav2_navigate_action_client()
 
         result_ready = threading.Event()
         goal_msg = {
-            "pose": _pose_stamped(goal_pose),
+            "pose": _pose_stamped(goal_pose, frame_id=self._goal_frame_id),
             "behavior_tree": "",
         }
 
         def _on_result(result: dict) -> None:
             with self._lock:
+                self._pending_cancel = None
                 self._last_result = result
                 self._status = self._result_status(result)
                 self._status_ts = time.time()
                 self._last_error = None if self._status == "succeeded" else self._result_error(result)
             result_ready.set()
 
-        try:
-            goal = roslibpy.actionlib.Goal(self._action_client, roslibpy.Message(goal_msg))
-            with self._lock:
-                self._goal = goal
-                self._status = "sent"
-                self._status_ts = time.time()
-                self._last_goal = dict(goal_pose)
-                self._last_error = None
-            goal.send(result_callback=_on_result)
-        except Exception as exc:
-            self._action_failed = True
-            raise RuntimeError(f"nav2 navigate_to_pose send failed: {exc}") from exc
+        if self._action_api == "legacy":
+            try:
+                goal = roslibpy.actionlib.Goal(self._action_client, roslibpy.Message(goal_msg))
+                with self._lock:
+                    self._pending_cancel = goal.cancel
+                    self._status = "sent"
+                    self._status_ts = time.time()
+                    self._last_goal = dict(goal_pose)
+                    self._last_error = None
+                goal.send(result_callback=_on_result)
+            except Exception as exc:
+                with self._lock:
+                    self._pending_cancel = None
+                self._action_failed = True
+                raise RuntimeError(f"nav2 navigate_to_pose send failed: {exc}") from exc
+        else:
+            gid_holder: dict[str, Any] = {"id": None}
+            client = self._action_client
+
+            def _cancel_modern() -> None:
+                gid = gid_holder["id"]
+                if gid:
+                    client.cancel_goal(gid)
+
+            def _modern_errback(err: Any) -> None:
+                with self._lock:
+                    self._pending_cancel = None
+                    self._last_error = str(err)
+                    self._status = "failed"
+                    self._status_ts = time.time()
+                    self._last_goal = dict(goal_pose)
+                result_ready.set()
+
+            try:
+                with self._lock:
+                    self._pending_cancel = _cancel_modern
+                    self._status = "sent"
+                    self._status_ts = time.time()
+                    self._last_goal = dict(goal_pose)
+                    self._last_error = None
+
+                gid_holder["id"] = client.send_goal(
+                    roslibpy.Goal(goal_msg),
+                    _on_result,
+                    lambda _fb: None,
+                    _modern_errback,
+                )
+            except Exception as exc:
+                with self._lock:
+                    self._pending_cancel = None
+                self._action_failed = True
+                raise RuntimeError(f"nav2 navigate_to_pose send failed: {exc}") from exc
+
+            if not gid_holder["id"]:
+                with self._lock:
+                    self._pending_cancel = None
+                    self._last_error = "action client rejected goal"
+                    self._status = "failed"
+                raise RuntimeError("nav2 navigate_to_pose send failed: action client rejected goal")
 
         # Wait briefly for an immediate transport-side failure, but do not block for completion.
         result_ready.wait(timeout=min(max(timeout_s, 0.0), 0.25))
@@ -251,12 +433,18 @@ class Nav2NavigateClient:
                 self._status_ts = time.time()
                 self._last_error = None
             return result
+        if self._goal_pose_topic is not None:
+            return {
+                "status": "idle",
+                "reason": "goal_pose_topic mode: cancel via Nav2 / BT navigator, not rosbridge",
+            }
         with self._lock:
-            goal = self._goal
-        if goal is None:
+            cancel_fn = self._pending_cancel
+            self._pending_cancel = None
+        if cancel_fn is None:
             return {"status": "idle", "reason": "no active nav2 goal"}
         try:
-            goal.cancel()
+            cancel_fn()
         except Exception as exc:
             raise RuntimeError(f"nav2 cancel failed: {exc}") from exc
         with self._lock:
@@ -302,11 +490,23 @@ class Nav2NavigateClient:
         return str(msg)
 
 
-def _pose_stamped(pose: dict) -> dict:
+def _ros2_stamp_now() -> dict:
+    t = time.time()
+    sec = int(t)
+    nanosec = int((t - sec) * 1e9)
+    return {"sec": sec, "nanosec": nanosec}
+
+
+def _pose_stamped(pose: dict, *, frame_id: str = "map", stamp: Optional[dict] = None) -> dict:
     yaw = float(pose.get("yaw_rad", pose.get("yaw", 0.0)))
     half = yaw / 2.0
+    hdr = {"frame_id": frame_id}
+    if stamp is not None:
+        hdr["stamp"] = stamp
+    else:
+        hdr["stamp"] = _ros2_stamp_now()
     return {
-        "header": {"frame_id": "map"},
+        "header": hdr,
         "pose": {
             "position": {
                 "x": float(pose["x_m"]),
@@ -350,10 +550,15 @@ class MapRuntime:
             "global_costmap": _CacheEntry(),
         }
         self._transforms: dict[tuple[str, str], _Transform2D] = {}
-        self._nav2_client = nav2_client or Nav2PathClient(ros_client) if ros_client is not None else nav2_client
+        self._nav2_client = (
+            nav2_client or Nav2PathClient(ros_client, pose_frame_id=map_frame)
+            if ros_client is not None
+            else nav2_client
+        )
         self._nav2_navigate_client = (
-            nav2_navigate_client or Nav2NavigateClient(ros_client)
-            if ros_client is not None else nav2_navigate_client
+            nav2_navigate_client or Nav2NavigateClient(ros_client, goal_frame_id=map_frame)
+            if ros_client is not None
+            else nav2_navigate_client
         )
         if ros_client is not None:
             self._subscribe_all()
@@ -382,6 +587,11 @@ class MapRuntime:
             except Exception:
                 pass
         self._subs = []
+        if self._nav2_navigate_client is not None:
+            try:
+                self._nav2_navigate_client.close()
+            except Exception:
+                pass
 
     # --- test-friendly ingestion helpers ---
 

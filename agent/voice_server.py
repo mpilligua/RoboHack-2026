@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import atexit
 import io
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -29,6 +31,7 @@ from robot import (  # noqa: E402
     MapRuntime,
     connect_ros2_rosbridge,
 )
+from robot.map_runtime import Nav2NavigateClient  # noqa: E402
 from safety.supervisor import SafetySupervisor  # noqa: E402
 from tools.base import ToolContext  # noqa: E402
 from tools.setup import build_registry  # noqa: E402
@@ -43,6 +46,18 @@ WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "en")
 TTS_VOICE = os.environ.get("TTS_VOICE", "Samantha")
 LISTEN_HOST = os.environ.get("VOICE_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("VOICE_PORT", "5050"))
+
+
+def _parse_max_hz(env_key: str, default: float) -> float | None:
+    raw = os.environ.get(env_key)
+    if raw is None or str(raw).strip() == "":
+        value = default
+    else:
+        value = float(raw)
+    if value <= 0:
+        return None
+    return value
+
 
 _robot_state = {
     "robot": None,
@@ -59,6 +74,8 @@ _robot_state = {
 def _connect_robot():
     host = os.environ.get("ROS_BRIDGE_HOST", "192.168.1.103")
     motion_port = int(os.environ.get("ROS2_BRIDGE_PORT", "9091"))
+    rgb_hz = _parse_max_hz("RGB_MAX_HZ", 2.0)
+    depth_hz = _parse_max_hz("DEPTH_MAX_HZ", 2.0)
 
     try:
         print(f"[voice] connecting to ROS 2 bridge ws://{host}:{motion_port} ...", file=sys.stderr)
@@ -68,17 +85,45 @@ def _connect_robot():
 
     ros2 = _robot_state["ros2_client"]
     print(f"[voice] connecting to ROS 2 perception bridge ws://{host}:{motion_port} ...", file=sys.stderr)
-    _robot_state["robot"] = Lite3Robot(host=host, port=motion_port, ros_client=ros2)
+    _robot_state["robot"] = Lite3Robot(
+        host=host,
+        port=motion_port,
+        max_rgb_hz=rgb_hz,
+        max_depth_hz=depth_hz,
+        ros_client=ros2,
+    )
 
     if ros2 is not None:
         try:
+            map_frame = os.environ.get("ROS2_MAP_FRAME", "map")
+            goal_topic = (os.environ.get("NAV2_GOAL_POSE_TOPIC") or "").strip() or None
+            goal_msg_type = os.environ.get("NAV2_GOAL_MESSAGE_TYPE", "PoseStamped")
+            nav_goal_client = (
+                Nav2NavigateClient(
+                    ros2,
+                    goal_pose_topic=goal_topic,
+                    goal_message_type=goal_msg_type,
+                    goal_frame_id=map_frame,
+                )
+                if goal_topic
+                else None
+            )
             _robot_state["map_runtime"] = MapRuntime(
                 ros_client=ros2,
                 base_frame=os.environ.get("ROS2_BASE_FRAME", "rslidar"),
-                map_frame=os.environ.get("ROS2_MAP_FRAME", "map"),
+                map_frame=map_frame,
                 odom_frame=os.environ.get("ROS2_ODOM_FRAME", "odom"),
+                nav2_navigate_client=nav_goal_client,
             )
             print("[voice] map runtime connected", file=sys.stderr)
+            if goal_topic:
+                print(f"[voice] Nav2 via {goal_msg_type} topic {goal_topic!r}", file=sys.stderr)
+            elif not os.environ.get("NAV_SUPPRESS_TOPIC_HINT"):
+                print(
+                    "[voice] Nav2 hint: add NAV2_GOAL_POSE_TOPIC=/goal_pose to .env if "
+                    "go_to_map_pose does not move the robot (Foxy rosbridge has no actions).",
+                    file=sys.stderr,
+                )
         except Exception as exc:
             print(f"[voice] map runtime failed: {exc}", file=sys.stderr)
         for name, cls in (("motion", Lite3Motion), ("follow", Lite3Follow), ("basic_goal", Lite3BasicGoal)):
@@ -106,10 +151,57 @@ def _connect_robot():
         registry = build_registry()
         planner = PlannerAgent(registry, ctx, client=None)
         _robot_state["orchestrator"] = Orchestrator(planner, memory)
+        _robot_state["safety"] = safety
         print("[voice] bedrock agent ready [native converse + current tools]", file=sys.stderr)
     except Exception as exc:
         print(f"[voice] bedrock agent init failed: {exc}", file=sys.stderr)
         _robot_state["orchestrator"] = None
+        _robot_state["safety"] = None
+
+
+def _shutdown_robot() -> None:
+    """Mirrors cli.py's finally-block cleanup. Idempotent."""
+    if _robot_state.get("_shutdown_done"):
+        return
+    _robot_state["_shutdown_done"] = True
+    print("[voice] shutting down robot connections ...", file=sys.stderr)
+    follow = _robot_state.get("follow")
+    motion = _robot_state.get("motion")
+    basic_goal = _robot_state.get("basic_goal")
+    map_runtime = _robot_state.get("map_runtime")
+    ros2 = _robot_state.get("ros2_client")
+    robot = _robot_state.get("robot")
+    for adapter in (follow, motion):
+        if adapter is None:
+            continue
+        try:
+            adapter.stop()
+        except Exception:
+            pass
+        try:
+            adapter.close()
+        except Exception:
+            pass
+    if basic_goal is not None:
+        try:
+            basic_goal.close()
+        except Exception:
+            pass
+    if map_runtime is not None:
+        try:
+            map_runtime.close()
+        except Exception:
+            pass
+    if ros2 is not None:
+        try:
+            ros2.terminate()
+        except Exception:
+            pass
+    if robot is not None:
+        try:
+            robot.close()
+        except Exception:
+            pass
 
 
 _whisper = {"model": None, "lock": threading.Lock()}
@@ -204,47 +296,151 @@ INDEX_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
-<title>Lite3 voice</title>
+<title>Lite3 guide-dog</title>
 <style>
-  :root { color-scheme: dark; }
-  body { font-family: -apple-system, system-ui, sans-serif; background: #111; color: #eee; margin: 0; padding: 16px; }
-  h1 { font-size: 18px; margin: 0 0 12px; opacity: .7; font-weight: 500; }
-  #ptt, #enableAudio, #stopBtn {
-    display: block; width: 100%; border: none; border-radius: 24px;
-    background: #1f6feb; color: white; font-weight: 600;
-    -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+  :root {
+    color-scheme: dark;
+    --bg: #0b0d12;
+    --panel: #151925;
+    --panel-2: #1c2132;
+    --accent: #4f8cff;
+    --accent-2: #6ea8ff;
+    --danger: #ff4d5e;
+    --danger-2: #ff6b7a;
+    --good: #3ecf8e;
+    --text: #e8ecf5;
+    --muted: #8892a6;
   }
-  #ptt, #enableAudio { height: 220px; font-size: 28px; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+    background: radial-gradient(1200px 600px at 20% -10%, #1a2240 0%, var(--bg) 60%);
+    color: var(--text);
+    margin: 0;
+    padding: 20px 16px 28px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 520px; margin: 0 auto; }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin: 4px 2px 18px;
+  }
+  .brand {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 15px; font-weight: 600; letter-spacing: .02em;
+  }
+  .brand .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--good); box-shadow: 0 0 0 4px rgba(62,207,142,.18);
+  }
+  .brand .dot.busy { background: #ffc857; box-shadow: 0 0 0 4px rgba(255,200,87,.18); }
+  .brand .dot.err  { background: var(--danger); box-shadow: 0 0 0 4px rgba(255,77,94,.18); }
+  .sub { color: var(--muted); font-size: 12px; font-weight: 500; }
+
+  #status {
+    font-size: 14px;
+    padding: 10px 14px;
+    border-radius: 12px;
+    margin-bottom: 14px;
+    background: var(--panel);
+    border: 1px solid #222839;
+    transition: background .2s, color .2s;
+  }
+  #status[data-kind="busy"]  { background: rgba(255,200,87,.08);  color: #ffdd8a; border-color: rgba(255,200,87,.25); }
+  #status[data-kind="rec"]   { background: rgba(255,77,94,.10);   color: #ffb0b8; border-color: rgba(255,77,94,.30); }
+  #status[data-kind="error"] { background: rgba(255,77,94,.12);   color: #ff98a2; border-color: rgba(255,77,94,.35); }
+  #status[data-kind="ok"]    { background: rgba(62,207,142,.10);  color: #8ee9c0; border-color: rgba(62,207,142,.30); }
+
+  button {
+    font-family: inherit;
+    border: none;
+    border-radius: 18px;
+    color: white;
+    font-weight: 600;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+    cursor: pointer;
+    transition: transform .05s, background .15s, box-shadow .15s;
+  }
+  button:active { transform: scale(.985); }
+
+  #enableAudio, #ptt {
+    display: block;
+    width: 100%;
+    height: 200px;
+    font-size: 26px;
+    letter-spacing: .01em;
+    background: linear-gradient(180deg, var(--accent) 0%, #3a6fe0 100%);
+    box-shadow: 0 10px 30px -12px rgba(79,140,255,.55), inset 0 1px 0 rgba(255,255,255,.12);
+  }
+  #enableAudio { background: linear-gradient(180deg, #3ecf8e 0%, #2fae77 100%);
+                 box-shadow: 0 10px 30px -12px rgba(62,207,142,.5), inset 0 1px 0 rgba(255,255,255,.12); }
+  #ptt.recording {
+    background: linear-gradient(180deg, var(--danger) 0%, #cc3445 100%);
+    box-shadow: 0 10px 30px -10px rgba(255,77,94,.6), inset 0 1px 0 rgba(255,255,255,.12);
+    animation: pulse 1s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 10px 30px -10px rgba(255,77,94,.6), 0 0 0 0 rgba(255,77,94,.35); }
+    50%      { box-shadow: 0 10px 30px -10px rgba(255,77,94,.6), 0 0 0 14px rgba(255,77,94,0); }
+  }
+
   #stopBtn {
-    height: 80px; font-size: 22px; margin-top: 12px;
-    background: #d63838; letter-spacing: 0.15em;
+    width: 100%;
+    height: 76px;
+    margin-top: 12px;
+    font-size: 20px;
+    letter-spacing: .22em;
+    background: linear-gradient(180deg, var(--danger) 0%, #c23140 100%);
+    box-shadow: 0 8px 24px -10px rgba(255,77,94,.55), inset 0 1px 0 rgba(255,255,255,.12);
   }
-  #stopBtn:active { background: #ff4d4d; }
-  #enableAudio { background: #2ea043; }
-  #ptt.recording { background: #d63838; }
-  #status { font-size: 14px; padding: 8px 12px; border-radius: 8px; margin-bottom: 10px; background: #222; }
-  #status[data-kind="busy"]  { background: #3b3b1a; color: #ffe680; }
-  #status[data-kind="rec"]   { background: #5a1a1a; color: #ffb3b3; }
-  #status[data-kind="error"] { background: #5a1a1a; color: #ff8080; }
-  .log { margin-top: 16px; }
-  .turn { padding: 12px 14px; border-radius: 14px; margin-bottom: 10px; line-height: 1.35; }
-  .me { background: #243559; }
-  .bot { background: #2a2a2a; }
-  .meta { font-size: 12px; opacity: .5; margin-top: 4px; }
+  #stopBtn:active { background: linear-gradient(180deg, var(--danger-2) 0%, #cc3445 100%); }
+
+  .log { margin-top: 22px; display: flex; flex-direction: column; gap: 10px; }
+  .turn {
+    padding: 12px 14px;
+    border-radius: 14px;
+    line-height: 1.4;
+    font-size: 15px;
+    border: 1px solid transparent;
+    animation: slideIn .18s ease-out;
+  }
+  @keyframes slideIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+  .me  { background: linear-gradient(180deg, #1f3a6e 0%, #1a2f5a 100%); border-color: #2a4985; align-self: flex-end; max-width: 90%; }
+  .bot { background: var(--panel-2); border-color: #242a3d; align-self: flex-start; max-width: 95%; }
+  .meta { font-size: 11px; color: var(--muted); margin-top: 6px; letter-spacing: .04em; text-transform: uppercase; }
+
+  .hint {
+    text-align: center;
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 10px;
+    letter-spacing: .02em;
+  }
 </style>
 </head>
 <body>
-  <h1>guide-dog voice</h1>
+<div class="wrap">
+  <header>
+    <div class="brand"><span class="dot" id="statusDot"></span><span>guide-dog voice</span></div>
+    <div class="sub">hold to speak</div>
+  </header>
   <div id="status">idle</div>
   <button id="enableAudio">tap once to enable audio</button>
   <button id="ptt" hidden>hold to talk</button>
-  <button id="stopBtn" hidden>stop audio</button>
+  <button id="stopBtn" hidden>STOP</button>
+  <div class="hint" id="hint" hidden>hold the blue button while speaking</div>
   <div class="log" id="log"></div>
+</div>
 <script>
 const ptt = document.getElementById('ptt');
 const enableBtn = document.getElementById('enableAudio');
+const stopBtn = document.getElementById('stopBtn');
+const hint = document.getElementById('hint');
 const log = document.getElementById('log');
 const statusEl = document.getElementById('status');
+const statusDot = document.getElementById('statusDot');
 let mediaRecorder = null;
 let chunks = [];
 let replyAudio = null;
@@ -261,24 +457,35 @@ enableBtn.addEventListener('click', async () => {
     await replyAudio.play();
     enableBtn.hidden = true;
     ptt.hidden = false;
-    document.getElementById('stopBtn').hidden = false;
-    setStatus('audio enabled - ready', 'idle');
+    stopBtn.hidden = false;
+    hint.hidden = false;
+    setStatus('ready', 'ok');
   } catch (err) {
     setStatus('could not enable audio: ' + (err.message || err.name), 'error');
   }
 });
 
-document.getElementById('stopBtn').addEventListener('click', () => {
+stopBtn.addEventListener('click', async () => {
+  // Immediately pause speech playback...
   if (replyAudio) {
-    replyAudio.pause();
-    replyAudio.currentTime = 0;
+    try { replyAudio.pause(); replyAudio.currentTime = 0; } catch (e) {}
   }
-  setStatus('idle', 'idle');
+  // ...and hard-stop the robot without waiting on the LLM path.
+  setStatus('stopping robot...', 'busy');
+  try {
+    const res = await fetch('/stop', { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    if (data.ok) setStatus('stopped', 'ok');
+    else setStatus('stop reported errors: ' + (data.errors || []).join('; '), 'error');
+  } catch (err) {
+    setStatus('stop request failed: ' + (err.message || err), 'error');
+  }
 });
 
 function setStatus(text, kind) {
   statusEl.textContent = text;
   statusEl.dataset.kind = kind || 'idle';
+  statusDot.className = 'dot' + (kind === 'busy' || kind === 'rec' ? ' busy' : kind === 'error' ? ' err' : '');
 }
 
 function add(role, text, meta) {
@@ -332,7 +539,7 @@ async function startRecording() {
     mediaRecorder.start();
     ptt.classList.add('recording');
     ptt.textContent = 'release to send';
-    setStatus('recording...', 'rec');
+    setStatus('listening...', 'rec');
   } catch (err) {
     setStatus('mic blocked: ' + (err.message || err.name), 'error');
   }
@@ -379,7 +586,7 @@ async function sendAudio(blob, ext) {
 function addPlayButton(parentDiv, url) {
   const btn = document.createElement('button');
   btn.textContent = 'play reply';
-  btn.style.cssText = 'margin-top:8px;padding:6px 14px;border-radius:8px;border:none;background:#1f6feb;color:#fff;font-size:14px;';
+  btn.style.cssText = 'margin-top:8px;padding:8px 16px;border-radius:10px;background:var(--accent);color:#fff;font-size:14px;';
   btn.onclick = () => {
     const a = new Audio(url);
     a.onended = () => setStatus('idle', 'idle');
@@ -497,6 +704,48 @@ def talk():
     return jsonify({"transcript": transcript, "reply": reply, "tts_id": tts_id})
 
 
+@app.route("/stop", methods=["POST"])
+def stop():
+    """Hard-stop the robot without going through the LLM.
+
+    Wired to the big red button in the UI so a blind user gets an immediate
+    halt — no Whisper, no Bedrock, no tool dispatch in the loop.
+    """
+    errors: list[str] = []
+    safety = _robot_state.get("safety")
+    if safety is not None:
+        try:
+            safety.trigger_emergency_stop()
+        except Exception as exc:
+            errors.append(f"safety: {exc}")
+    for key in ("follow", "motion", "robot", "basic_goal"):
+        obj = _robot_state.get(key)
+        if obj is None:
+            continue
+        for method in ("stop", "cancel"):
+            fn = getattr(obj, method, None)
+            if fn is None:
+                continue
+            try:
+                fn()
+            except Exception as exc:
+                errors.append(f"{key}.{method}: {exc}")
+    return jsonify({"ok": not errors, "errors": errors})
+
+
+@app.route("/resume", methods=["POST"])
+def resume():
+    """Clear the latched emergency-stop flag."""
+    safety = _robot_state.get("safety")
+    if safety is None:
+        return jsonify({"ok": False, "reason": "safety not initialized"}), 503
+    try:
+        safety.reset_emergency_stop()
+        return jsonify({"ok": True})
+    except Exception as exc:
+        return jsonify({"ok": False, "reason": str(exc)}), 500
+
+
 @app.route("/tts_test")
 def tts_test():
     audio = tts_to_wav("hello, this is a test of the audio path.")
@@ -520,12 +769,29 @@ def tts():
 def main() -> None:
     preload_whisper()
     _connect_robot()
+    atexit.register(_shutdown_robot)
+
+    def _handle_signal(signum, _frame):
+        print(f"[voice] received signal {signum}, shutting down", file=sys.stderr)
+        _shutdown_robot()
+        sys.exit(0)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handle_signal)
+        except (ValueError, OSError):
+            # Not on main thread or unsupported on this platform.
+            pass
+
     print(
         f"[voice] serving on http://{LISTEN_HOST}:{LISTEN_PORT}/  "
         f"(open from your phone using your laptop's WiFi IP).",
         file=sys.stderr,
     )
-    app.run(host=LISTEN_HOST, port=LISTEN_PORT, threaded=True)
+    try:
+        app.run(host=LISTEN_HOST, port=LISTEN_PORT, threaded=True)
+    finally:
+        _shutdown_robot()
 
 
 if __name__ == "__main__":

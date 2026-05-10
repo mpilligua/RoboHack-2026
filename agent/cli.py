@@ -22,6 +22,7 @@ from robot import (  # noqa: E402
     MapRuntime,
     connect_ros2_rosbridge,
 )
+from robot.map_runtime import Nav2NavigateClient  # noqa: E402
 from safety.supervisor import SafetySupervisor  # noqa: E402
 from tools.base import ToolContext  # noqa: E402
 from tools.setup import build_registry  # noqa: E402
@@ -135,13 +136,35 @@ def main() -> None:
 
     if ros2_client is not None:
         try:
+            map_frame = os.environ.get("ROS2_MAP_FRAME", "map")
+            goal_topic = (os.environ.get("NAV2_GOAL_POSE_TOPIC") or "").strip() or None
+            goal_msg_type = os.environ.get("NAV2_GOAL_MESSAGE_TYPE", "PoseStamped")
+            nav_goal_client = (
+                Nav2NavigateClient(
+                    ros2_client,
+                    goal_pose_topic=goal_topic,
+                    goal_message_type=goal_msg_type,
+                    goal_frame_id=map_frame,
+                )
+                if goal_topic
+                else None
+            )
             map_runtime = MapRuntime(
                 ros_client=ros2_client,
                 base_frame=os.environ.get("ROS2_BASE_FRAME", "rslidar"),
-                map_frame=os.environ.get("ROS2_MAP_FRAME", "map"),
+                map_frame=map_frame,
                 odom_frame=os.environ.get("ROS2_ODOM_FRAME", "odom"),
+                nav2_navigate_client=nav_goal_client,
             )
             print("map runtime connected", file=sys.stderr)
+            if goal_topic:
+                print(f"Nav2 navigation via {goal_msg_type} topic {goal_topic!r}", file=sys.stderr)
+            elif not os.environ.get("NAV_SUPPRESS_TOPIC_HINT"):
+                print(
+                    "Nav2 hint: Foxy rosbridge 1.x has no ROS 2 actions — if the robot ignores "
+                    "go_to_map_pose, add NAV2_GOAL_POSE_TOPIC=/goal_pose to agent/.env (see .env.example).",
+                    file=sys.stderr,
+                )
         except Exception as exc:
             print(f"map runtime failed: {exc}", file=sys.stderr)
         try:

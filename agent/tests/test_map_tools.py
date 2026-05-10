@@ -2,11 +2,14 @@ import math
 import os
 import sys
 import time
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from memory.store import MemoryStore
-from robot.map_runtime import MapRuntime, Nav2PathClient
+import roslibpy
+
+from robot.map_runtime import MapRuntime, Nav2NavigateClient, Nav2PathClient
 from safety.supervisor import SafetySupervisor
 from tools.base import ToolContext
 from tools.map_tools import (
@@ -237,3 +240,20 @@ def test_compare_map_vs_live_scan_flags_dynamic_obstacle():
     result = handle_compare_map_vs_live_scan(_ctx(runtime), {})
     assert result.ok
     assert result.result["data"]["possible_dynamic_obstacle"] is True
+
+
+def test_nav2_goal_pose_topic_publishes_pose_stamped():
+    fake_ros = MagicMock()
+    fake_pub = MagicMock()
+    with patch("robot.map_runtime.roslibpy.Topic", return_value=fake_pub) as mock_topic:
+        nav = Nav2NavigateClient(fake_ros, goal_pose_topic="/goal_pose", goal_frame_id="map")
+        st = nav.navigate_to_pose({"x_m": 0.5, "y_m": 0.25, "yaw_rad": 0.0}, timeout_s=0.01)
+    fake_pub.advertise.assert_called_once()
+    mock_topic.assert_called_once_with(fake_ros, "/goal_pose", "geometry_msgs/PoseStamped")
+    fake_pub.publish.assert_called_once()
+    msg = fake_pub.publish.call_args[0][0]
+    assert isinstance(msg, roslibpy.Message)
+    assert msg["header"]["frame_id"] == "map"
+    assert "stamp" in msg["header"]
+    assert abs(msg["pose"]["position"]["x"] - 0.5) < 1e-6
+    assert st["status"] == "published"

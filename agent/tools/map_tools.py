@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 from .base import ToolContext, ToolResult
 
@@ -13,6 +14,22 @@ def _require_map_runtime(ctx: ToolContext, tool: str):
 def _require_waypoints(ctx: ToolContext, tool: str):
     if ctx.waypoints is None:
         raise RuntimeError(f"waypoint store not connected (tool: {tool})")
+
+
+def _warnings_if_nav_action_unreliable_rosbridge(nav: dict) -> list[str]:
+    if (os.environ.get("NAV2_GOAL_POSE_TOPIC") or "").strip():
+        return []
+    if os.environ.get("NAV_SUPPRESS_TOPIC_HINT"):
+        return []
+    if nav.get("status") != "sent":
+        return []
+    return [
+        "Nav2 goal reported as \"sent\" over rosbridge actions; many Foxy stacks "
+        "cannot deliver send_action_goal, so the robot may not move. "
+        "Set NAV2_GOAL_POSE_TOPIC=/goal_pose in agent/.env and restart cli.py "
+        "(confirm topic with ros2 topic list on the robot). "
+        "Do not claim arrival or ongoing navigation until verified.",
+    ]
 
 
 def _success(tool: str, payload: dict) -> ToolResult:
@@ -248,7 +265,7 @@ def handle_go_to_map_pose(ctx: ToolContext, args: dict) -> ToolResult:
             "navigation": nav,
             "freshness": ctx.map_runtime.freshness(),
         }
-        return _success(tool, {"warnings": [], "data": data})
+        return _success(tool, {"warnings": _warnings_if_nav_action_unreliable_rosbridge(nav), "data": data})
     except Exception as exc:
         return _failure(tool, str(exc))
 
@@ -271,7 +288,7 @@ def handle_go_to_waypoint(ctx: ToolContext, args: dict) -> ToolResult:
             "navigation": nav,
             "freshness": ctx.map_runtime.freshness(),
         }
-        return _success(tool, {"warnings": [], "data": data})
+        return _success(tool, {"warnings": _warnings_if_nav_action_unreliable_rosbridge(nav), "data": data})
     except Exception as exc:
         return _failure(tool, str(exc))
 
