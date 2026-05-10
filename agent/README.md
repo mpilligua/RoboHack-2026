@@ -56,10 +56,24 @@ cp .env.example .env
 ## Run
 
 ```bash
-python -m agent.agent
+python cli.py
 ```
 
-You'll get a `>` prompt. Try:
+You'll get a `>` prompt. The CLI opens **two** websocket connections total: one to ROS 1 (camera), one shared ROS 2 session for motion + follow + basic goal adapters.
+
+Tune rosbridge load via `.env`:
+
+| Variable | Default (CLI) | Meaning |
+|----------|----------------|---------|
+| `RGB_MAX_HZ` | `2` | Max RGB fetches per second from rosbridge |
+| `DEPTH_MAX_HZ` | `2` | Max depth fetches per second |
+| `ROS2_BRIDGE_PORT` | `9091` | Foxy rosbridge port |
+
+Set `RGB_MAX_HZ=0` (or any `<= 0`) to disable the cap for that stream.
+
+Only one `cli.py` REPL per machine is allowed; a second launch exits unless you remove stale `agent/.cli.pid.lock`.
+
+Try:
 
 - `what do you see?`
 - `is there anything in front of the robot? how far?`
@@ -70,15 +84,24 @@ Tool calls and results are echoed to stderr so you can see the agent reasoning.
 
 ## Tools the agent has
 
-| Tool                | What it does                                                          |
-|---------------------|-----------------------------------------------------------------------|
-| `describe_scene`    | Captures one RGB frame, sends to Qwen-VL with a focus hint            |
-| `read_label`        | Captures one RGB frame, asks Qwen-VL to read text on a named item     |
-| `get_rgbd_summary`  | Local depth stats: closest, center distance, valid fraction           |
-| `get_pose`          | x, y, yaw from `/leg_odom`                                            |
-| `get_status`        | Connection + frame ages — diagnostics                                 |
-
-Locomotion (`/cmd_vel`) is wired via `Lite3Robot.set_velocity()` / `.stop()` but not exposed as a tool yet — that's Person A's slot in the plan.
+| Tool                  | What it does                                                          |
+|-----------------------|-----------------------------------------------------------------------|
+| `describe_scene`      | Captures one RGB frame, sends to Qwen-VL with a focus hint            |
+| `read_label`          | Captures one RGB frame, asks Qwen-VL to read text on a named item     |
+| `get_rgbd_summary`    | Local depth stats: closest, center distance, valid fraction           |
+| `get_depth_at_pixel`  | Approx depth for RGB pixel `(u,v)` + nearest-valid fallback window    |
+| `get_pose`            | x, y, yaw from `/leg_odom`                                            |
+| `get_status`          | Connection + frame ages — diagnostics                                 |
+| `stop_motion`           | Stop all motion                                                       |
+| `send_basic_goal`       | Send absolute (x, y, theta) goal to ROS2 basic_goal_controller        |
+| `cancel_basic_goal`     | Cancel the current basic goal                                         |
+| `get_basic_goal_status` | Read or wait for basic goal status                                   |
+| `get_ros2_odom`          | Latest ROS2 odometry pose (x, y, z, yaw)                             |
+| `send_simple_cmd`       | Send low-level MotionSimpleCMD (cmd_code/size/type)                   |
+| `send_complex_cmd`      | Send low-level MotionComplexCMD (cmd_code/size/type/data)             |
+| `follow_person`       | Follow a YOLO-tracked target                                         |
+| `go_to_object`        | Approach a YOLO-tracked object                                       |
+| `stop_tracking`       | Stop follow/go-to tracking                                           |
 
 ## Troubleshooting
 

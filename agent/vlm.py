@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import base64
 import os
+from functools import lru_cache
 from typing import Optional
 
 import boto3
 
 
+@lru_cache(maxsize=1)
 def make_client():
+    """Cached singleton — boto3 clients hold a urllib3 connection pool, so
+    rebuilding one per call throws away keep-alive TLS sessions to Bedrock."""
     region = os.environ.get("AWS_REGION", "us-east-1")
     return boto3.client("bedrock-runtime", region_name=region)
 

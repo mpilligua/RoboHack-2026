@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import threading
 import time
+from typing import Optional
 
 import roslibpy
 
@@ -30,14 +31,31 @@ def _clip(v: float, hi: float) -> float:
 
 
 class Lite3Motion:
-    def __init__(self, host: str = "192.168.1.103", port: int = 9091, connect_timeout_s: float = 10.0):
-        self._client = roslibpy.Ros(host=host, port=port)
-        self._client.run(timeout=connect_timeout_s)
-        if not self._client.is_connected:
-            raise RuntimeError(
-                f"Could not connect to foxy rosbridge at ws://{host}:{port}. "
-                "Is `ros2 launch rosbridge_server rosbridge_websocket_launch.xml port:=9091` running?"
-            )
+    def __init__(
+        self,
+        host: str = "192.168.1.103",
+        port: int = 9091,
+        connect_timeout_s: float = 10.0,
+        *,
+        ros_client: Optional[roslibpy.Ros] = None,
+    ):
+        """Publish ``/cmd_vel`` via ROS 2 rosbridge.
+
+        If ``ros_client`` is set, it must already be connected; this adapter does
+        not terminate it on ``close()`` (caller owns the socket).
+        """
+        if ros_client is not None:
+            self._client = ros_client
+            self._owns_client = False
+        else:
+            self._client = roslibpy.Ros(host=host, port=port)
+            self._client.run(timeout=connect_timeout_s)
+            if not self._client.is_connected:
+                raise RuntimeError(
+                    f"Could not connect to foxy rosbridge at ws://{host}:{port}. "
+                    "Is `ros2 launch rosbridge_server rosbridge_websocket_launch.xml port:=9091` running?"
+                )
+            self._owns_client = True
         self._cmd_vel = roslibpy.Topic(self._client, CMD_VEL_TOPIC, "geometry_msgs/Twist")
         self._cmd_vel.advertise()
         self._stop_flag = threading.Event()
@@ -73,6 +91,30 @@ class Lite3Motion:
         # Always end with a zero — important so the dog doesn't keep coasting.
         self._publish(0.0, 0.0, 0.0)
 
+    def drive_continuous(self, vx: float, vy: float, omega: float, max_duration_s: float, hz: float = 20.0) -> float:
+        """Long-running velocity command bypassing the 2-second per-call cap
+        and the trailing zero. Intended for callers that own their own
+        interrupt path (set ``_stop_flag`` via ``stop()``) and want a smooth
+        continuous motion — e.g. the search-and-rotate sweep.
+
+        DOES NOT publish a final zero. Caller MUST eventually call ``stop()``
+        (or a normal ``forward``/``turn_*`` etc.) to halt the dog. Returns
+        actual elapsed time so the caller can compute distance/angle traveled.
+        """
+        vx = _clip(vx, MAX_LINEAR)
+        vy = _clip(vy, MAX_LINEAR)
+        omega = _clip(omega, MAX_ANGULAR)
+        max_duration_s = max(0.0, float(max_duration_s))
+
+        self._stop_flag.clear()
+        period = 1.0 / hz
+        start = time.time()
+        deadline = start + max_duration_s
+        while time.time() < deadline and not self._stop_flag.is_set():
+            self._publish(vx, vy, omega)
+            time.sleep(period)
+        return time.time() - start
+
     def forward(self, speed: float = 0.15, duration_s: float = 1.0) -> None:
         self._drive(speed, 0.0, 0.0, duration_s)
 
@@ -100,7 +142,11 @@ class Lite3Motion:
             self._cmd_vel.unadvertise()
         except Exception:
             pass
-        self._client.terminate()
+        if self._owns_client:
+            try:
+                self._client.terminate()
+            except Exception:
+                pass  # roslibpy 2.0 cleanup bug; harmless
 
     def __enter__(self) -> "Lite3Motion":
         return self
