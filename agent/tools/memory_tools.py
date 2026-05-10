@@ -52,6 +52,7 @@ def handle_resolve_reference(ctx: ToolContext, args: dict) -> ToolResult:
     obj = ctx.memory.resolve_reference(ref)
     if obj is None:
         return ToolResult(ok=False, tool="resolve_reference", error=f"could not resolve reference: {ref!r}")
+    ctx.memory.set_selected_object_id(obj.yolo_id)
     return ToolResult(
         ok=True,
         tool="resolve_reference",

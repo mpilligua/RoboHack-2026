@@ -93,10 +93,8 @@ Tool calls and results are echoed to stderr so you can see the agent reasoning.
 | `get_pose`            | x, y, yaw from `/leg_odom`                                            |
 | `get_status`          | Connection + frame ages — diagnostics                                 |
 | `stop_motion`           | Stop all motion                                                       |
-| `send_basic_goal`       | Send absolute (x, y, theta) goal to ROS2 basic_goal_controller        |
 | `cancel_basic_goal`     | Cancel the current basic goal                                         |
 | `get_basic_goal_status` | Read or wait for basic goal status                                   |
-| `get_ros2_odom`          | Latest ROS2 odometry pose (x, y, z, yaw)                             |
 | `send_simple_cmd`       | Send low-level MotionSimpleCMD (cmd_code/size/type)                   |
 | `send_complex_cmd`      | Send low-level MotionComplexCMD (cmd_code/size/type/data)             |
 | `follow_person`       | Follow a YOLO-tracked target                                         |

@@ -35,3 +35,5 @@ class ToolContext:
     basic_goal: Any  # Lite3BasicGoal | None
     vlm: Any       # VLMClientProtocol
     safety: Any    # SafetySupervisor
+    map_runtime: Any = None
+    waypoints: Any = None

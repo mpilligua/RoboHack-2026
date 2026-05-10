@@ -164,19 +164,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         required=["duration_s"],
     ),
     _spec(
-        "send_basic_goal",
-        (
-            "Send an absolute 2D goal (x, y, theta) in meters/radians to the "
-            "ROS2 basic_goal_controller. Use this for distance-based navigation."
-        ),
-        {
-            "x": {"type": "number", "description": "Goal x position in meters."},
-            "y": {"type": "number", "description": "Goal y position in meters."},
-            "theta": {"type": "number", "description": "Goal heading in radians."},
-        },
-        required=["x", "y", "theta"],
-    ),
-    _spec(
         "cancel_basic_goal",
         "Cancel the current basic goal.",
         {"reason": {"type": "string", "description": "Optional cancel reason."}},
@@ -188,11 +175,6 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "wait_for": {"type": "string", "description": "Target status to wait for."},
             "timeout_s": {"type": "number", "description": "Max seconds to wait."},
         },
-    ),
-    _spec(
-        "get_ros2_odom",
-        "Return latest ROS2 odometry pose: x, y, z, yaw.",
-        {},
     ),
     _spec(
         "send_simple_cmd",
@@ -504,15 +486,6 @@ def _require_basic_goal(basic_goal):
         )
 
 
-def _send_basic_goal(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
-    _require_basic_goal(basic_goal)
-    x = float(args["x"])
-    y = float(args["y"])
-    theta = float(args["theta"])
-    basic_goal.send_goal(x, y, theta)
-    return json.dumps({"ok": True, "action": "send_basic_goal", "x": x, "y": y, "theta": theta})
-
-
 def _cancel_basic_goal(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
     _require_basic_goal(basic_goal)
     reason = str(args.get("reason", "stop"))
@@ -530,14 +503,6 @@ def _get_basic_goal_status(robot, motion, follow, basic_goal, vlm, args: dict) -
     if status.get("status") is None:
         status["note"] = "no status yet"
     return json.dumps(status)
-
-
-def _get_ros2_odom(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
-    _require_basic_goal(basic_goal)
-    odom = basic_goal.get_odom()
-    if odom is None:
-        return json.dumps({"note": "no odom yet"})
-    return json.dumps(odom)
 
 
 def _send_simple_cmd(robot, motion, follow, basic_goal, vlm, args: dict) -> str:
@@ -573,10 +538,8 @@ _HANDLERS = {
     "walk_backward": _walk_backward,
     "turn_left": _turn_left,
     "turn_right": _turn_right,
-    "send_basic_goal": _send_basic_goal,
     "cancel_basic_goal": _cancel_basic_goal,
     "get_basic_goal_status": _get_basic_goal_status,
-    "get_ros2_odom": _get_ros2_odom,
     "send_simple_cmd": _send_simple_cmd,
     "send_complex_cmd": _send_complex_cmd,
 }
