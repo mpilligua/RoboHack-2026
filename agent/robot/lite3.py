@@ -28,10 +28,9 @@ from .rgbd_naive import compute_depth_at_rgb_pixel_naive
 
 
 RGB_TOPIC = "/camera/color/image_raw"
-# Raw depth topic (not aligned to RGB). Pixel-perfect overlay would need
-# /camera/aligned_depth_to_color, but that isn't always published.
-# Good enough for distance summaries and obstacle detection.
-DEPTH_TOPIC = "/camera/depth/image_raw"
+# Rectified depth (camera intrinsics applied); not aligned to RGB — pixel overlay
+# would need aligned_depth_to_color when available.
+DEPTH_TOPIC = "/camera/depth/image_rect_raw"
 IMU_TOPIC = "/imu/data"
 ODOM_TOPIC = "/leg_odom"
 JOINT_TOPIC = "/joint_states"
