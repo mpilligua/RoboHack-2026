@@ -29,3 +29,7 @@ lite_cog_ros2/*
 
 # Agent CLI single-instance lock (safe to delete if stale)
 agent/.cli.pid.lock
+
+# Mock robot pose used by perception/external_pose.py
+agent/.mock_pose.json
+Untitled/*

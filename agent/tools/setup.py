@@ -22,6 +22,10 @@ def build_registry() -> ToolRegistry:
     reg.register("get_visible_objects", memory_tools.handle_get_visible_objects, [CALLER_PLANNER])
     reg.register("resolve_reference", memory_tools.handle_resolve_reference, [CALLER_PLANNER])
     reg.register("find_objects_matching_constraints", memory_tools.handle_find_objects_matching_constraints, [CALLER_PLANNER])
+    # World map (Plan B): persistent semantic map populated by perception/world_tick.py
+    reg.register("find_object_in_world", memory_tools.handle_find_object, [CALLER_PLANNER])
+    reg.register("list_world_objects", memory_tools.handle_list_world_objects, [CALLER_PLANNER])
+    reg.register("go_to_world_object", memory_tools.handle_go_to_world_object, [CALLER_PLANNER])
 
     # Motion tools
     reg.register("walk_forward", motion_tools.handle_walk_forward, [CALLER_PLANNER])

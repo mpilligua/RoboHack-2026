@@ -42,6 +42,9 @@ _READ_ONLY_TOOLS = frozenset({
     "get_robot_status",
     "get_basic_goal_status",
     "get_ros2_odom",
+    # World map (read-only memory queries):
+    "list_world_objects",
+    "find_object_in_world",
 })
 
 # Worker count: small. Most parallel batches are 2-3 tools; more workers
@@ -93,6 +96,13 @@ Tool selection rules:
       or when filtering for a specific COCO class via label_filter.
 - list_visible_objects accepts label_filter — use it instead of listing-then-filtering.
 - go_to_object returns immediately and auto-stops. Do NOT poll get_basic_goal_status.
+- World-map tools (list_world_objects, find_object_in_world, go_to_world_object) operate
+  on REMEMBERED objects with stored world coordinates. Prefer them when the user
+  references an object 'you saw earlier', asks to 'come back to', or wants positions
+  in world coordinates. list_visible_objects only sees what's in the current frame.
+- go_to_world_object navigates by stored coordinates and works EVEN IF the object
+  isn't currently visible — use this instead of find_and_go_to when you have a
+  remembered position.
 - After go_to_object / find_and_go_to / find_person_and_follow runs, the navigation
   outcome (reached / lost_target / timeout) is written to the memory snapshot's
   recent events with type='nav_outcome'. If the user asks 'did you reach it?' or

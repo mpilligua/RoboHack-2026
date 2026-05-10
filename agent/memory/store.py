@@ -45,6 +45,17 @@ class MemoryStore:
                     existing.depth_m = record.depth_m
                 if record.position_text is not None:
                     existing.position_text = record.position_text
+                # World-frame fields populated by perception/world_tick.py.
+                # Only overwrite when the new record has them — partial updates
+                # without depth/pose shouldn't clobber a prior good projection.
+                if record.x_odom is not None:
+                    existing.x_odom = record.x_odom
+                if record.y_odom is not None:
+                    existing.y_odom = record.y_odom
+                if record.z_odom is not None:
+                    existing.z_odom = record.z_odom
+                if record.pose_stamp is not None:
+                    existing.pose_stamp = record.pose_stamp
                 existing.last_seen_ts = record.last_seen_ts
                 existing.seen_count += 1
             else:

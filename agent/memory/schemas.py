@@ -28,6 +28,13 @@ class ObjectRecord:
     position_text: Optional[str] = None  # "left" | "center" | "right"
     last_seen_ts: float = field(default_factory=time.time)
     seen_count: int = 1
+    # World position in /leg_odom frame (drifty over minutes, fine for short tasks).
+    # Populated by agent/perception/world_map.py when it can compute a pose. None if
+    # depth/pose unavailable for that detection.
+    x_odom: Optional[float] = None
+    y_odom: Optional[float] = None
+    z_odom: Optional[float] = None
+    pose_stamp: Optional[float] = None
 
 
 @dataclass

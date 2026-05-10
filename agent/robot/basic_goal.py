@@ -12,7 +12,7 @@ import roslibpy
 BASIC_GOAL_TOPIC = "/basic_goal"
 BASIC_GOAL_CANCEL_TOPIC = "/basic_goal_cancel"
 BASIC_GOAL_STATUS_TOPIC = "/basic_goal_status"
-ODOM_TOPIC = "/odom"
+ODOM_TOPIC = "/leg_odom2"
 SIMPLE_CMD_TOPIC = "/simple_cmd"
 COMPLEX_CMD_TOPIC = "/complex_cmd"
 
@@ -72,7 +72,7 @@ class Lite3BasicGoal:
             self._client, BASIC_GOAL_STATUS_TOPIC, "std_msgs/String"
         )
         self._status_sub.subscribe(self._on_status)
-        self._odom_sub = roslibpy.Topic(self._client, ODOM_TOPIC, "nav_msgs/Odometry")
+        self._odom_sub = roslibpy.Topic(self._client, ODOM_TOPIC, "geometry_msgs/PoseWithCovarianceStamped")
         self._odom_sub.subscribe(self._on_odom)
 
     def _on_status(self, msg: dict) -> None:

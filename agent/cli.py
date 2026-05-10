@@ -247,6 +247,7 @@ def main() -> None:
             print(f"basic goal adapter failed: {e}", file=sys.stderr)
 
     orchestrator = None
+    world_tick = None
     if _USE_NEW_PIPELINE:
         try:
             memory = MemoryStore()
@@ -267,6 +268,19 @@ def main() -> None:
             orchestrator = Orchestrator(planner, memory)
             backend = "openai-compat" if oa_client else "bedrock-boto3"
             print(f"new pipeline ready [{backend}] (LEGACY_LOOP=1 to use legacy loop)", file=sys.stderr)
+
+            # Background world-object updater: pulls YOLO detections + RGB + depth
+            # + pose, projects detections into /leg_odom frame, upserts into
+            # MemoryStore so find_object / list_world_objects return positions.
+            # Disabled if follow adapter isn't available (no detections to project).
+            if follow is not None and os.environ.get("DISABLE_WORLD_TICK") != "1":
+                try:
+                    from perception.world_tick import WorldTickDriver
+                    period = float(os.environ.get("WORLD_TICK_PERIOD_S", "1.0"))
+                    world_tick = WorldTickDriver(robot, follow, memory, period_s=period)
+                    world_tick.start()
+                except Exception as e:
+                    print(f"world tick failed to start: {e}", file=sys.stderr)
         except Exception as e:
             print(f"new pipeline init failed: {e} — falling back to legacy loop", file=sys.stderr)
             orchestrator = None
