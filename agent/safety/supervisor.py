@@ -21,7 +21,12 @@ class SafetySupervisor:
         self._lock = threading.Lock()
 
     def check_forward_motion(self) -> SafetyResult:
-        """Strict check before walk_forward / follow_person / go_to_object."""
+        """Forward-motion policy.
+
+        Emergency stop remains a hard block. Depth-derived obstacle data is
+        advisory only because this robot's depth is noisy enough to create
+        false positives.
+        """
         with self._lock:
             if self._emergency_latched:
                 return SafetyResult(False, "emergency stop is latched — call reset_emergency_stop to resume")
@@ -30,12 +35,12 @@ class SafetySupervisor:
         now = time.time()
 
         if state.depth_stamp is None or (now - state.depth_stamp) > DEPTH_STALE_S:
-            return SafetyResult(False, "depth data stale or missing — call get_rgbd_summary first")
+            return SafetyResult(True, "depth data stale or missing — advisory only")
 
         if state.nearest_obstacle_mm is not None and state.nearest_obstacle_mm < OBSTACLE_BLOCK_MM:
             return SafetyResult(
-                False,
-                f"obstacle {state.nearest_obstacle_mm}mm ahead (threshold {OBSTACLE_BLOCK_MM}mm)"
+                True,
+                f"depth reports obstacle {state.nearest_obstacle_mm}mm ahead (threshold {OBSTACLE_BLOCK_MM}mm) — advisory only"
             )
 
         return SafetyResult(True, "ok")

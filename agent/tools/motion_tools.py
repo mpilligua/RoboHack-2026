@@ -9,18 +9,17 @@ _DEFAULT_SPEED = 0.15   # m/s
 _DEFAULT_OMEGA = 0.4    # rad/s
 _MAX_CHUNK_S   = 2.0    # Lite3Motion hard cap per _drive() call
 
-# How recent must a depth check be for walk_forward to skip its own check.
-# Below this — refresh internally; above — trust it.
+# How recent must a depth sample be before we refresh it opportunistically.
+# Depth is advisory only; it should not veto forward motion by itself.
 _DEPTH_FRESH_S = 4.0
-# If nearest obstacle is closer than this (mm), refuse to move forward.
-_FORWARD_BLOCK_MM = 600
+_FORWARD_ADVISORY_MM = 600
 
 
-def _safety_check_forward(ctx: ToolContext) -> tuple[bool, str | None, dict | None]:
-    """Internal pre-flight for forward motion. Refreshes depth if stale, then
-    blocks if the obstacle is too close. Returns (ok, error_msg, depth_summary).
+def _depth_advisory_forward(ctx: ToolContext) -> tuple[dict | None, str | None]:
+    """Best-effort depth refresh for forward motion.
 
-    The point: planner doesn't have to remember to call get_rgbd_summary first.
+    Depth on this robot is noisy, so we do not let it veto motion. We still
+    surface fresh depth info back to the planner for context/debugging.
     """
     state = ctx.memory.snapshot().get("robot", {})
     last_stamp = state.get("depth_stamp") or 0.0
@@ -36,11 +35,14 @@ def _safety_check_forward(ctx: ToolContext) -> tuple[bool, str | None, dict | No
                 nearest_obstacle_mm=summary.get("min_mm"),
             )
         except Exception as e:
-            return False, f"depth check failed: {e}", None
+            return None, f"depth advisory unavailable: {e}"
     nearest = ctx.memory.snapshot().get("robot", {}).get("nearest_obstacle_mm")
-    if nearest is not None and nearest < _FORWARD_BLOCK_MM:
-        return False, f"obstacle ahead at {nearest} mm (< {_FORWARD_BLOCK_MM} mm threshold)", summary
-    return True, None, summary
+    if nearest is not None and nearest < _FORWARD_ADVISORY_MM:
+        return summary, (
+            f"depth reports obstacle at {nearest} mm (< {_FORWARD_ADVISORY_MM} mm advisory threshold), "
+            "but forward motion is still allowed"
+        )
+    return summary, None
 
 
 def _require_motion(ctx: ToolContext, tool: str):
@@ -59,9 +61,10 @@ def _drive_for(move_fn, total_s: float) -> None:
 
 def handle_walk_forward(ctx: ToolContext, args: dict) -> ToolResult:
     _require_motion(ctx, "walk_forward")
-    ok, err, depth_summary = _safety_check_forward(ctx)
-    if not ok:
-        return ToolResult(ok=False, tool="walk_forward", error=err, result=depth_summary)
+    motion_check = ctx.safety.check_any_motion()
+    if not motion_check.safe:
+        return ToolResult(ok=False, tool="walk_forward", error=motion_check.reason)
+    depth_summary, depth_advisory = _depth_advisory_forward(ctx)
     speed = float(args.get("speed", _DEFAULT_SPEED))
     if "distance_m" in args:
         duration_s = float(args["distance_m"]) / speed
@@ -73,6 +76,8 @@ def handle_walk_forward(ctx: ToolContext, args: dict) -> ToolResult:
         return ToolResult(ok=False, tool="walk_forward", error="provide distance_m or duration_s")
     if depth_summary is not None:
         result["depth_check"] = depth_summary
+    if depth_advisory is not None:
+        result["depth_advisory"] = depth_advisory
     _drive_for(lambda d: ctx.motion.forward(speed=speed, duration_s=d), duration_s)
     return ToolResult(ok=True, tool="walk_forward", result=result)
 

@@ -80,10 +80,8 @@ TOOL_OUTPUT_HINTS = {
     "find_and_go_to":   '{"label": "<str>", "found_yolo_id": <int>, "found_label": "<str>", "swept_deg": <float>, "direction": "left|right", "go_to_object": {"action": "go_to_object", "yolo_id": <int>, "status": "approaching"}}',
     "find_object":      '{"label": "<str>", "yolo_id": <int>, "found_label": "<str>", "swept_deg": <float>, "direction": "left|right"}',
     "find_person_and_follow": '{"label": "person", "found_yolo_id": <int>, "found_label": "person", "swept_deg": <float>, "direction": "left|right", "follow_person": {"action": "follow_person", "yolo_id": <int>}}',
-    "send_basic_goal":  '{"action": "send_basic_goal", "x": <float>, "y": <float>, "theta": <float>, "status": "accepted"}',
     "cancel_basic_goal":'{"action": "cancel_basic_goal", "status": "cancelled"}',
     "get_basic_goal_status": '{"status": "goal_reached"}',
-    "get_ros2_odom":    '{"x": <float>, "y": <float>, "z": <float>, "yaw": <float>}',
     "send_simple_cmd":  '{"action": "send_simple_cmd", "ack": true}',
     "send_complex_cmd": '{"action": "send_complex_cmd", "ack": true}',
 }

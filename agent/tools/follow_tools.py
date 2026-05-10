@@ -23,6 +23,7 @@ _LOST_TARGET_GRACE_S = 3.0
 def handle_follow_person(ctx: ToolContext, args: dict) -> ToolResult:
     _require_follow(ctx, "follow_person")
     yolo_id = int(args["yolo_id"])
+    ctx.memory.set_selected_object_id(yolo_id)
     ctx.follow.follow(yolo_id)
     return ToolResult(ok=True, tool="follow_person", result={"action": "follow_person", "yolo_id": yolo_id})
 
@@ -33,6 +34,7 @@ def handle_go_to_object(ctx: ToolContext, args: dict) -> ToolResult:
     stop_distance_m = float(args.get("stop_distance_m", 0.8))
     timeout_s = float(args.get("timeout_s", 30.0))
 
+    ctx.memory.set_selected_object_id(yolo_id)
     ctx.follow.follow(yolo_id)
 
     def _record_outcome(outcome: str, detail: str, last_depth_m: float | None) -> None:

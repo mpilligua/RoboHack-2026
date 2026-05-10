@@ -8,15 +8,6 @@ def _require_basic_goal(ctx: ToolContext, tool: str):
         raise RuntimeError(f"basic goal adapter not connected (tool: {tool})")
 
 
-def handle_send_basic_goal(ctx: ToolContext, args: dict) -> ToolResult:
-    _require_basic_goal(ctx, "send_basic_goal")
-    x = float(args["x"])
-    y = float(args["y"])
-    theta = float(args["theta"])
-    ctx.basic_goal.send_goal(x, y, theta)
-    return ToolResult(ok=True, tool="send_basic_goal", result={"x": x, "y": y, "theta": theta})
-
-
 def handle_cancel_basic_goal(ctx: ToolContext, args: dict) -> ToolResult:
     _require_basic_goal(ctx, "cancel_basic_goal")
     reason = str(args.get("reason", "stop"))
@@ -34,14 +25,6 @@ def handle_get_basic_goal_status(ctx: ToolContext, args: dict) -> ToolResult:
     if status.get("status") is None:
         status["note"] = "no status yet"
     return ToolResult(ok=True, tool="get_basic_goal_status", result=status)
-
-
-def handle_get_ros2_odom(ctx: ToolContext, _args: dict) -> ToolResult:
-    _require_basic_goal(ctx, "get_ros2_odom")
-    odom = ctx.basic_goal.get_odom()
-    if odom is None:
-        return ToolResult(ok=True, tool="get_ros2_odom", result={"note": "no odom yet"})
-    return ToolResult(ok=True, tool="get_ros2_odom", result=odom)
 
 
 def handle_send_simple_cmd(ctx: ToolContext, args: dict) -> ToolResult:

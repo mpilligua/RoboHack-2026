@@ -1,9 +1,4 @@
-"""Tool schemas and dispatcher for the planner agent.
-
-Provides both Bedrock-native (toolSpec) and OpenAI-compatible formats.
-The boto3 path (PLANNER_TOOLS_BEDROCK) is the default.
-The openai path (PLANNER_TOOLS) is used when AGENT_BASE_URL is set.
-"""
+"""Bedrock-native tool schemas and dispatcher for the planner agent."""
 
 from __future__ import annotations
 
@@ -17,6 +12,112 @@ _SPECS = [
         "get_robot_status",
         "Get robot connection status and depth summary.",
         {}, [],
+    ),
+    (
+        "get_robot_pose_in_map",
+        "Get the robot's current pose in the map frame from live TF. Use this before saving or reasoning about waypoints.",
+        {},
+        [],
+    ),
+    (
+        "get_map_summary",
+        "Summarize the static map, map freshness, and whether robot pose is available. Use this for broad map context, not for clearance.",
+        {},
+        [],
+    ),
+    (
+        "get_local_map_context",
+        "Describe nearby free, blocked, and unknown directions around the robot using live scan first, then local costmap. Prefer this over trusting the static map when discussing safe movement nearby.",
+        {
+            "radius_m": {"type": "number", "description": "Radius around the robot to inspect in meters (default 3.0)."},
+        },
+        [],
+    ),
+    (
+        "get_local_occupancy_grid",
+        "Return a small robot-centered symbolic occupancy grid fused from live scan, local costmap, and map fill-in. Use when you need compact spatial structure for reasoning.",
+        {
+            "size_m": {"type": "number", "description": "Width and height of the square local grid in meters (default 5.0)."},
+            "cell_size_m": {"type": "number", "description": "Cell size in meters (default 0.25)."},
+        },
+        [],
+    ),
+    (
+        "save_waypoint",
+        "Save the robot's current pose as a named waypoint in the current session. Only use when the user explicitly wants to remember a place.",
+        {
+            "name": {"type": "string", "description": "Unique waypoint name."},
+            "type": {"type": "string", "description": "Optional waypoint category (default 'generic')."},
+        },
+        ["name"],
+    ),
+    (
+        "list_waypoints",
+        "List all saved waypoints for this agent session.",
+        {},
+        [],
+    ),
+    (
+        "get_waypoint",
+        "Get one saved waypoint by name.",
+        {
+            "name": {"type": "string", "description": "Waypoint name."},
+        },
+        ["name"],
+    ),
+    (
+        "check_waypoint_reachable",
+        "Check whether a saved waypoint is likely reachable now. Prefer this for route analysis or debugging. Uses Nav2 planning when available and falls back to heuristics. Advisory only; does not move the robot.",
+        {
+            "name": {"type": "string", "description": "Waypoint name."},
+        },
+        ["name"],
+    ),
+    (
+        "get_route_summary_to_waypoint",
+        "Summarize the likely route to a saved waypoint for a blind user. Advisory only; does not move the robot. Use this when the user wants a route description, not as a required pre-check before Nav2 navigation.",
+        {
+            "name": {"type": "string", "description": "Waypoint name."},
+        },
+        ["name"],
+    ),
+    (
+        "compare_map_vs_live_scan",
+        "Compare the static map against the current live scan and costmaps. Use when you suspect dynamic obstacles or localization drift.",
+        {},
+        [],
+    ),
+    (
+        "go_to_map_pose",
+        "Navigate to an absolute map-frame pose using Nav2. Use this for requests like 'go to 0,0' or 'go to x y heading'. Trust Nav2 and local avoidance to handle obstacles during execution; do not add manual local obstacle pre-checks unless the user asked for analysis or a prior attempt failed.",
+        {
+            "x": {"type": "number", "description": "Goal x position in the map frame, meters."},
+            "y": {"type": "number", "description": "Goal y position in the map frame, meters."},
+            "yaw_rad": {"type": "number", "description": "Goal heading in radians. Defaults to 0.0."},
+            "timeout_s": {"type": "number", "description": "Optional short dispatch timeout while sending the Nav2 goal."},
+        },
+        ["x", "y"],
+    ),
+    (
+        "go_to_waypoint",
+        "Navigate to a previously saved waypoint using Nav2. Prefer this over manually looking up the waypoint and then calling go_to_map_pose. Trust Nav2 and local avoidance during execution instead of requiring manual obstacle pre-checks.",
+        {
+            "name": {"type": "string", "description": "Waypoint name."},
+            "timeout_s": {"type": "number", "description": "Optional short dispatch timeout while sending the Nav2 goal."},
+        },
+        ["name"],
+    ),
+    (
+        "get_navigation_status",
+        "Get the latest Nav2 navigation status for the active map-pose or waypoint goal.",
+        {},
+        [],
+    ),
+    (
+        "cancel_navigation",
+        "Cancel the active Nav2 navigation goal.",
+        {"reason": {"type": "string", "description": "Optional cancellation reason."}},
+        [],
     ),
     (
         "describe_scene",
@@ -47,20 +148,42 @@ _SPECS = [
         ["u", "v"],
     ),
     (
+        "get_visible_objects",
+        "Return recently seen objects from memory with ids, labels, descriptions, positions, "
+        "depth, and recency. Cheap read-only memory lookup: prefer this before calling "
+        "list_visible_objects when a recent object may already be known.",
+        {},
+        [],
+    ),
+    (
         "list_visible_objects",
         "YOLO-detected objects (COCO classes only) with per-detection VLM descriptions and "
         "yolo_ids you can pass to follow_person / go_to_object. Use when the user wants to "
-        "act on a specific object, or asks 'is there a <COCO thing> nearby'. Do NOT also call "
-        "describe_scene in the same turn.",
+        "act on a specific object and you need a fresh current id, or asks 'is there a <COCO "
+        "thing> nearby'. Prefer get_visible_objects first when recent memory may already be "
+        "enough. Do NOT also call describe_scene in the same turn.",
         {"label_filter": {"type": "string", "description": "Optional case-insensitive substring "
             "to filter by label, e.g. 'chair'. Omit to list everything."}},
         [],
     ),
     (
         "resolve_reference",
-        "Resolve 'it', 'that', 'the chair on the left' to a specific object in memory.",
+        "Resolve 'it', 'that', 'the chair on the left' to a specific remembered object. If it "
+        "returns an id, you can pass that id straight to go_to_object or follow_person.",
         {"ref": {"type": "string", "description": "The reference string to resolve."}},
         ["ref"],
+    ),
+    (
+        "find_objects_matching_constraints",
+        "Filter remembered objects by constraints like label, position, or depth. Prefer this "
+        "over fresh perception when the needed object may already be in memory.",
+        {
+            "label": {"type": "string", "description": "Optional case-insensitive label match."},
+            "position": {"type": "string", "description": "Optional position hint: left, center, or right."},
+            "max_depth_m": {"type": "number", "description": "Optional maximum depth in meters."},
+            "min_depth_m": {"type": "number", "description": "Optional minimum depth in meters."},
+        },
+        [],
     ),
     (
         "walk_forward",
@@ -106,32 +229,6 @@ _SPECS = [
     ),
     ("stop_motion", "Stop all robot motion without stopping the tracker.", {}, []),
     (
-        "send_basic_goal",
-        "Send an absolute 2D goal (x, y, theta) to the ROS2 basic_goal_controller.",
-        {
-            "x": {"type": "number", "description": "Goal x position (meters)."},
-            "y": {"type": "number", "description": "Goal y position (meters)."},
-            "theta": {"type": "number", "description": "Goal heading in radians."},
-        },
-        ["x", "y", "theta"],
-    ),
-    (
-        "cancel_basic_goal",
-        "Cancel the current basic goal.",
-        {"reason": {"type": "string", "description": "Optional cancel message."}},
-        [],
-    ),
-    (
-        "get_basic_goal_status",
-        "Get the latest basic goal status; can optionally wait for a target status.",
-        {
-            "wait_for": {"type": "string", "description": "Target status to wait for."},
-            "timeout_s": {"type": "number", "description": "Max seconds to wait."},
-        },
-        [],
-    ),
-    ("get_ros2_odom", "Return latest ROS2 odometry pose (x, y, z, yaw).", {}, []),
-    (
         "send_simple_cmd",
         "Send a low-level MotionSimpleCMD message.",
         {
@@ -154,14 +251,18 @@ _SPECS = [
     ),
     (
         "follow_person",
-        "Continuously follow a YOLO-tracked target. Call list_visible_objects first.",
+        "Continuously follow a YOLO-tracked target. If you already have a recent yolo_id from "
+        "memory, resolve_reference, or find_person_and_follow, call this directly. Otherwise "
+        "get or refresh an id first.",
         {"yolo_id": {"type": "integer", "description": "The YOLO detection id to follow."}},
         ["yolo_id"],
     ),
     (
         "go_to_object",
-        "Approach a YOLO-tracked object and auto-stop when close. Call list_visible_objects "
-        "first to get a yolo_id. Returns IMMEDIATELY after dispatching the goal; the robot "
+        "Approach a YOLO-tracked object and auto-stop when close. If you already have a recent "
+        "yolo_id from memory, resolve_reference, or find_object, call this directly. Only "
+        "refresh with list_visible_objects when you truly need a fresh id. Returns IMMEDIATELY "
+        "after dispatching the goal; the robot "
         "stops itself when median depth in the target bbox <= stop_distance_m. Do NOT poll "
         "get_basic_goal_status afterwards — assume success unless an error follows.",
         {
@@ -220,13 +321,6 @@ _SPECS = [
 ]
 
 
-def _make_openai_tool(name, description, properties, required):
-    params = {"type": "object", "properties": properties}
-    if required:
-        params["required"] = required
-    return {"type": "function", "function": {"name": name, "description": description, "parameters": params}}
-
-
 def _make_bedrock_tool(name, description, properties, required):
     schema: dict = {"type": "object", "properties": properties}
     if required:
@@ -234,8 +328,6 @@ def _make_bedrock_tool(name, description, properties, required):
     return {"toolSpec": {"name": name, "description": description, "inputSchema": {"json": schema}}}
 
 
-# OpenAI-compatible format (used when AGENT_BASE_URL is set)
-PLANNER_TOOLS: list[dict] = [_make_openai_tool(*s) for s in _SPECS]
 
 # Bedrock-native toolSpec format (default — works with boto3)
 PLANNER_TOOLS_BEDROCK: list[dict] = [_make_bedrock_tool(*s) for s in _SPECS]

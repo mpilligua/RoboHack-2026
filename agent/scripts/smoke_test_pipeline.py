@@ -1,7 +1,7 @@
-"""Smoke test for the new agent pipeline.
+"""Smoke test for the Bedrock-native agent pipeline.
 
-Requires a live robot connection and AGENT_BASE_URL / AGENT_API_KEY / AGENT_MODEL
-env vars set. Run from the agent/ directory:
+Requires a live robot connection and Bedrock credentials. Run from the
+agent/ directory:
 
     python scripts/smoke_test_pipeline.py
 
@@ -24,7 +24,7 @@ from memory.store import MemoryStore
 from safety.supervisor import SafetySupervisor
 from tools.base import ToolContext
 from tools.setup import build_registry
-from agents_app.sdk_agents import PlannerAgent, _make_agent_client
+from agents_app.sdk_agents import PlannerAgent
 from agents_app.orchestrator import Orchestrator
 
 
@@ -63,8 +63,7 @@ def _build_orchestrator(robot, motion, follow, basic_goal):
         safety=safety,
     )
     registry = build_registry()
-    oa_client = _make_agent_client()
-    planner = PlannerAgent(oa_client, registry, ctx)
+    planner = PlannerAgent(registry, ctx, client=None)
     return Orchestrator(planner, memory)
 
 

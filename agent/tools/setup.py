@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .registry import CALLER_OPERATOR, CALLER_PLANNER, ToolRegistry
-from . import basic_goal_tools, follow_tools, memory_tools, motion_tools, perception_tools, safety_tools
+from . import basic_goal_tools, follow_tools, map_tools, memory_tools, motion_tools, perception_tools, safety_tools
 
 
 def build_registry() -> ToolRegistry:
@@ -10,6 +10,22 @@ def build_registry() -> ToolRegistry:
     # Safety tools
     reg.register("stop", safety_tools.handle_stop, [CALLER_PLANNER, CALLER_OPERATOR])
     reg.register("get_robot_status", safety_tools.handle_get_robot_status, [CALLER_PLANNER, CALLER_OPERATOR])
+
+    # Map tools
+    reg.register("get_robot_pose_in_map", map_tools.handle_get_robot_pose_in_map, [CALLER_PLANNER, CALLER_OPERATOR])
+    reg.register("get_map_summary", map_tools.handle_get_map_summary, [CALLER_PLANNER, CALLER_OPERATOR])
+    reg.register("get_local_map_context", map_tools.handle_get_local_map_context, [CALLER_PLANNER, CALLER_OPERATOR])
+    reg.register("get_local_occupancy_grid", map_tools.handle_get_local_occupancy_grid, [CALLER_PLANNER, CALLER_OPERATOR])
+    reg.register("save_waypoint", map_tools.handle_save_waypoint, [CALLER_PLANNER, CALLER_OPERATOR])
+    reg.register("list_waypoints", map_tools.handle_list_waypoints, [CALLER_PLANNER, CALLER_OPERATOR])
+    reg.register("get_waypoint", map_tools.handle_get_waypoint, [CALLER_PLANNER, CALLER_OPERATOR])
+    reg.register("check_waypoint_reachable", map_tools.handle_check_waypoint_reachable, [CALLER_PLANNER, CALLER_OPERATOR])
+    reg.register("get_route_summary_to_waypoint", map_tools.handle_get_route_summary_to_waypoint, [CALLER_PLANNER, CALLER_OPERATOR])
+    reg.register("compare_map_vs_live_scan", map_tools.handle_compare_map_vs_live_scan, [CALLER_PLANNER, CALLER_OPERATOR])
+    reg.register("go_to_map_pose", map_tools.handle_go_to_map_pose, [CALLER_PLANNER])
+    reg.register("go_to_waypoint", map_tools.handle_go_to_waypoint, [CALLER_PLANNER])
+    reg.register("get_navigation_status", map_tools.handle_get_navigation_status, [CALLER_PLANNER, CALLER_OPERATOR])
+    reg.register("cancel_navigation", map_tools.handle_cancel_navigation, [CALLER_PLANNER, CALLER_OPERATOR])
 
     # Perception tools
     reg.register("describe_scene", perception_tools.handle_describe_scene, [CALLER_PLANNER])
@@ -30,27 +46,7 @@ def build_registry() -> ToolRegistry:
     reg.register("turn_right", motion_tools.handle_turn_right, [CALLER_PLANNER])
     reg.register("stop_motion", motion_tools.handle_stop_motion, [CALLER_PLANNER, CALLER_OPERATOR])
 
-    # Basic goal + low-level command tools
-    reg.register(
-        "send_basic_goal",
-        basic_goal_tools.handle_send_basic_goal,
-        [CALLER_PLANNER],
-    )
-    reg.register(
-        "cancel_basic_goal",
-        basic_goal_tools.handle_cancel_basic_goal,
-        [CALLER_PLANNER, CALLER_OPERATOR],
-    )
-    reg.register(
-        "get_basic_goal_status",
-        basic_goal_tools.handle_get_basic_goal_status,
-        [CALLER_PLANNER, CALLER_OPERATOR],
-    )
-    reg.register(
-        "get_ros2_odom",
-        basic_goal_tools.handle_get_ros2_odom,
-        [CALLER_PLANNER, CALLER_OPERATOR],
-    )
+    # Low-level command tools
     reg.register("send_simple_cmd", basic_goal_tools.handle_send_simple_cmd, [CALLER_PLANNER])
     reg.register("send_complex_cmd", basic_goal_tools.handle_send_complex_cmd, [CALLER_PLANNER])
 

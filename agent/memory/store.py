@@ -106,6 +106,11 @@ class MemoryStore:
         with self._lock:
             self.goal = None
 
+    def set_selected_object_id(self, yolo_id: int | None) -> None:
+        with self._lock:
+            if self.goal is not None:
+                self.goal.selected_object_id = yolo_id
+
     # --- events ---
 
     def add_event(self, event: Event) -> None:
@@ -141,6 +146,8 @@ class MemoryStore:
                     "description": o.description,
                     "position": o.position_text,
                     "depth_m": o.depth_m,
+                    "seen_count": o.seen_count,
+                    "last_seen_s_ago": round(max(0.0, time.time() - o.last_seen_ts), 2),
                 }
                 for o in sorted(self._objects.values(), key=lambda x: x.last_seen_ts, reverse=True)
             ]
